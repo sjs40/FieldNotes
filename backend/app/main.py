@@ -95,6 +95,12 @@ async def current_user(user: CurrentUser = Depends(get_current_user)):
     return {"id": user.id, "email": user.email, "display_name": user.display_name}
 
 
+@app.get("/api/auth/config")
+def auth_config():
+    """Publish only the Supabase URL and publishable key; never expose secrets."""
+    return {"enabled": settings.authentication_enabled, "url": settings.supabase_url, "publishable_key": settings.supabase_publishable_key}
+
+
 @app.post("/api/notes/parse")
 def parse(payload: ParseRequest):
     return parse_note(payload.body, payload.note_type)
