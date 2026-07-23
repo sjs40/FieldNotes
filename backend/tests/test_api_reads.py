@@ -42,6 +42,10 @@ class NormalizedReadApiTests(unittest.TestCase):
         self.assertEqual(calls.status_code, 200)
         self.assertEqual(calls.json()[0]["call"]["symbol"], "AAPL")
 
+        detail = self.client.get(f"/api/calls/{calls.json()[0]['call']['id']}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["returns"]["directional_return"], 0.0)
+
         tickers = self.client.get("/api/tickers")
         self.assertEqual(tickers.status_code, 200)
         self.assertEqual(tickers.json()[0]["symbol"], "AAPL")

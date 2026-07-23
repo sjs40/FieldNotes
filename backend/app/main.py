@@ -204,6 +204,28 @@ async def call_returns(call_id: str, user: CurrentUser = Depends(get_current_use
     return call_return_object(session, call)
 
 
+@app.get("/api/calls/{call_id}")
+async def call_detail(call_id: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    call = session.scalar(select(TrackedCall).where(TrackedCall.id == call_id, TrackedCall.user_id == user.id))
+    if not call:
+        raise HTTPException(status_code=404, detail="Tracked call not found")
+    note = session.scalar(select(Note).where(Note.id == call.originating_note_id, Note.user_id == user.id))
+    events = session.scalars(select(CallEvent).where(CallEvent.tracked_call_id == call.id).order_by(CallEvent.occurred_at.asc())).all()
+    updates = session.scalars(
+        select(Note).join(NoteRelationship, NoteRelationship.from_note_id == Note.id)
+        .where(NoteRelationship.to_note_id == call.originating_note_id, NoteRelationship.relationship_type == "update_of", Note.user_id == user.id)
+        .order_by(Note.created_at.asc())
+    ).all()
+    return {
+        "call": serialize_call(session, call),
+        "returns": call_return_object(session, call),
+        "originating_note": serialized_note(session, note) if note else None,
+        "updates": [serialized_note(session, update) for update in updates],
+        "events": [{"id": event.id, "type": event.event_type, "occurred_at": event.occurred_at.isoformat(), "explanation": event.explanation, "snapshot": event.snapshot_json} for event in events],
+        "reversed_from_call_id": call.reversed_from_call_id,
+    }
+
+
 @app.get("/api/tickers")
 async def list_tickers(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     rows = session.execute(
