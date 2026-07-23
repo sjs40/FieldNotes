@@ -17,6 +17,15 @@ app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
 
 
+def run_production_migrations() -> None:
+    """Apply committed Alembic revisions before a production instance serves."""
+    from alembic import command
+    from alembic.config import Config
+
+    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    command.upgrade(config, "head")
+
+
 class ParseRequest(BaseModel):
     body: str
     note_type: str = "note"
@@ -77,12 +86,14 @@ def record_frontend_note(session: Session, incoming: dict) -> Note:
 
 @app.on_event("startup")
 def bootstrap() -> None:
-    # Local convenience only. Production migrations run once as part of the
-    # Vercel build, before this release is allowed to serve traffic.
+    # Local convenience only. In production migrations run through Alembic,
+    # never through SQLAlchemy metadata creation.
     if not settings.is_production:
         Base.metadata.create_all(engine)
-    elif not settings.authentication_enabled:
+        return
+    if not settings.authentication_enabled:
         raise RuntimeError("Supabase authentication must be configured in production")
+    run_production_migrations()
 
 
 @app.get("/api/health")
