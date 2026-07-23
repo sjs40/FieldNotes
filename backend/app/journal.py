@@ -76,6 +76,10 @@ def _call_payload(session: Session, call: TrackedCall) -> dict:
     }
 
 
+def serialize_call(session: Session, call: TrackedCall) -> dict:
+    return _call_payload(session, call)
+
+
 def serialize_note(session: Session, note: Note) -> dict:
     """Produce the existing browser shape from normalized records.
 

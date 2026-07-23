@@ -4,15 +4,15 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import CallBenchmarkSnapshot, CallEvent, Note, Security, SecurityPrice, Tag, TrackedCall, TrackedCallLeg
+from .models import CallBenchmarkSnapshot, CallEvent, Note, NoteRevision, NoteSecurityMention, Security, SecurityPrice, Tag, TrackedCall, TrackedCallLeg
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
-from .journal import create_note, serialize_note as serialize_journal_note
+from .journal import create_note, serialize_call, serialize_note as serialize_journal_note
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
@@ -131,6 +131,63 @@ async def create_draft(payload: PublishRequest, user: CurrentUser = Depends(get_
     return serialized_note(session, note)
 
 
+@app.get("/api/notes/search")
+async def search_notes(q: str = "", user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    query = q.strip()
+    if not query:
+        return []
+    pattern = f"%{query}%"
+    notes = session.scalars(
+        select(Note).where(
+            Note.user_id == user.id,
+            or_(Note.title.ilike(pattern), Note.body.ilike(pattern)),
+        ).order_by(Note.created_at.desc())
+    ).all()
+    return [serialized_note(session, note) for note in notes]
+
+
+@app.get("/api/notes/{note_id}/revisions")
+async def list_revisions(note_id: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    note = session.scalar(select(Note).where(Note.id == note_id, Note.user_id == user.id))
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    revisions = session.scalars(select(NoteRevision).where(NoteRevision.note_id == note.id).order_by(NoteRevision.revision_number.desc())).all()
+    return [{"id": revision.id, "revision_number": revision.revision_number, "title": revision.title or "", "body": revision.body, "type": revision.type, "edited_at": revision.edited_at.isoformat()} for revision in revisions]
+
+
+@app.get("/api/calls")
+async def list_calls(status: str | None = None, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    statement = select(TrackedCall).where(TrackedCall.user_id == user.id)
+    if status:
+        statement = statement.where(TrackedCall.status == status)
+    calls = session.scalars(statement.order_by(TrackedCall.opened_at.desc())).all()
+    result = []
+    for call in calls:
+        note = session.get(Note, call.originating_note_id)
+        result.append({"note_id": call.originating_note_id, "note_title": note.title if note else None, "call": serialize_call(session, call)})
+    return result
+
+
+@app.get("/api/tickers")
+async def list_tickers(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    rows = session.execute(
+        select(Security.symbol, func.count(func.distinct(NoteSecurityMention.note_id)), func.min(Note.created_at))
+        .join(NoteSecurityMention, NoteSecurityMention.security_id == Security.id)
+        .join(Note, Note.id == NoteSecurityMention.note_id)
+        .where(Note.user_id == user.id)
+        .group_by(Security.symbol)
+        .order_by(Security.symbol)
+    ).all()
+    open_call_counts = dict(session.execute(
+        select(Security.symbol, func.count(TrackedCall.id))
+        .join(TrackedCallLeg, TrackedCallLeg.security_id == Security.id)
+        .join(TrackedCall, TrackedCall.id == TrackedCallLeg.tracked_call_id)
+        .where(TrackedCall.user_id == user.id, TrackedCall.status == "open")
+        .group_by(Security.symbol)
+    ).all())
+    return [{"symbol": symbol, "notes": notes, "open_calls": open_call_counts.get(symbol, 0), "first_mentioned_at": first.isoformat() if first else None} for symbol, notes, first in rows]
+
+
 @app.post("/api/notes/sync")
 def sync_notes(payload: SyncRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     """Legacy-only import bridge; new browser writes use individual note APIs."""
@@ -172,9 +229,11 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
 
 
 @app.post("/api/capture")
-def capture(payload: ParseRequest, session: Session = Depends(get_session)):
+def capture(payload: ParseRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     parsed = parse_note(payload.body, payload.note_type)
-    note = record_frontend_note(session, {"type": parsed["note_type"], "body": parsed["clean_body"], "status": "draft", "tags": parsed["tags"], "tickers": parsed["ticker_mentions"]})
+    if parsed["errors"]:
+        raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
+    note = create_note(session, user_id=user.id, parsed=parsed, title="", status="draft")
     session.commit()
     return {"note": serialized_note(session, note), "parse": parsed}
 
@@ -218,7 +277,7 @@ def refresh(payload: RefreshRequest, user: CurrentUser = Depends(get_current_use
 
 
 @app.post("/api/market-data/backfill-legacy")
-def backfill_legacy_entries(payload: BackfillRequest):
+def backfill_legacy_entries(payload: BackfillRequest, user: CurrentUser = Depends(get_current_user)):
     """Replace pre-backend demo entries with auditable historical closes."""
     provider = YFinanceMarketDataProvider()
     failures = []
@@ -247,32 +306,31 @@ def backfill_legacy_entries(payload: BackfillRequest):
     return {"notes": payload.notes, "failures": failures}
 
 
-@app.post("/api/calls/{note_id}/{event_type}")
-def lifecycle(note_id: str, event_type: str, payload: LifecycleRequest, session: Session = Depends(get_session)):
+@app.post("/api/calls/{call_id}/{event_type}")
+def lifecycle(call_id: str, event_type: str, payload: LifecycleRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     if event_type not in {"updated", "closed", "reversed", "invalidated"}:
         raise HTTPException(status_code=422, detail="Unsupported lifecycle event")
-    note = session.get(Note, note_id)
-    if not note:
-        raise HTTPException(status_code=404, detail="Note not found")
-    call = note.metadata_json.get("frontend", {}).get("call")
+    call = session.scalar(select(TrackedCall).where(TrackedCall.id == call_id, TrackedCall.user_id == user.id))
     if not call:
-        raise HTTPException(status_code=422, detail="This note has no tracked call")
+        raise HTTPException(status_code=404, detail="Tracked call not found")
     if event_type in {"closed", "invalidated", "reversed"}:
-        call["status"] = "invalidated" if event_type == "invalidated" else "closed"
-    note.metadata_json["frontend"]["call"] = call
-    session.add(CallEvent(note_id=note.id, event_type=event_type, explanation=payload.explanation, snapshot_json={"call": call}))
+        call.status = "invalidated" if event_type == "invalidated" else "closed"
+        call.closed_at = datetime.now(timezone.utc)
+        call.closing_reason = payload.explanation
+    session.add(CallEvent(note_id=call.originating_note_id, event_type=event_type, explanation=payload.explanation, snapshot_json={"tracked_call_id": call.id, "status": call.status}))
     session.commit()
-    return serialized_note(session, note)
+    return {"call": serialize_call(session, call)}
 
 
 @app.get("/api/export/calls.csv")
-def export_calls(session: Session = Depends(get_session)):
+def export_calls(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     rows = ["Call,Type,Status,Opened,Entry,Current"]
-    for note in session.scalars(select(Note)).all():
-        call = note.metadata_json.get("frontend", {}).get("call")
-        if call:
-            symbol = call.get("symbol") or f"{call['long']['symbol']}/{call['short']['symbol']}"
-            rows.append(f"{symbol},{call.get('type','')},{call.get('status','')},{call.get('opened','')},{call.get('entry','')},{call.get('current','')}")
+    for call in session.scalars(select(TrackedCall).where(TrackedCall.user_id == user.id).order_by(TrackedCall.opened_at.desc())).all():
+        payload = serialize_call(session, call)
+        symbol = payload.get("symbol") or f"{payload['long']['symbol']}/{payload['short']['symbol']}"
+        entry = payload.get("entry") or payload.get("long", {}).get("entry", "")
+        current = payload.get("current") or payload.get("long", {}).get("current", "")
+        rows.append(f"{symbol},{payload['type']},{payload['status']},{payload['opened']},{entry},{current}")
     return "\n".join(rows)
 
 
