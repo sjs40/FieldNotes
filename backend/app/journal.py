@@ -17,6 +17,7 @@ from .models import (
     TrackedCall,
     TrackedCallLeg,
 )
+from .returns import canonical_return_object
 
 
 def _security(session: Session, symbol: str) -> Security:
@@ -47,6 +48,32 @@ def _latest_price(session: Session, security_id: str, fallback: float) -> float:
         .limit(1)
     )
     return float(value) if value is not None else float(fallback)
+
+
+def _latest_quote_metadata(session: Session, security_id: str, fallback: float) -> tuple[float, dict]:
+    price = session.scalar(
+        select(SecurityPrice).where(SecurityPrice.security_id == security_id)
+        .order_by(SecurityPrice.timestamp.desc(), SecurityPrice.retrieved_at.desc()).limit(1)
+    )
+    if not price:
+        return float(fallback), {"provider": "entry_record", "price_type": "entry", "timestamp": None}
+    return float(price.raw_price), {"provider": price.provider, "price_type": price.price_type, "timestamp": price.timestamp}
+
+
+def call_return_object(session: Session, call: TrackedCall) -> dict:
+    legs = session.scalars(select(TrackedCallLeg).where(TrackedCallLeg.tracked_call_id == call.id).order_by(TrackedCallLeg.leg_order)).all()
+    benchmark = session.scalar(select(CallBenchmarkSnapshot).where(CallBenchmarkSnapshot.tracked_call_id == call.id))
+    terminal = call.status in {"closed", "invalidated"}
+    leg_data = []
+    for leg in legs:
+        current, quote = _latest_quote_metadata(session, leg.security_id, leg.entry_price_raw)
+        leg_data.append({"entry": leg.entry_price_adjusted or leg.entry_price_raw, "current": current, "exit": leg.exit_price_adjusted or leg.exit_price_raw, "direction": leg.direction})
+    benchmark_current, benchmark_quote = _latest_quote_metadata(session, benchmark.benchmark_security_id, benchmark.entry_price_raw)
+    return canonical_return_object(
+        call_id=call.id, status=call.status, call_type=call.call_type, legs=leg_data,
+        benchmark={"entry": benchmark.entry_price_adjusted or benchmark.entry_price_raw, "current": benchmark_current, "exit": benchmark.exit_price_adjusted or benchmark.exit_price_raw, "current_quote": benchmark_quote, "exit_quote": {"provider": benchmark.exit_provider, "price_type": benchmark.exit_price_type, "timestamp": benchmark.exit_quote_at}},
+        opened_at=call.opened_at, as_of=call.closed_at if terminal and call.closed_at else datetime.now(timezone.utc),
+    )
 
 
 def _call_payload(session: Session, call: TrackedCall) -> dict:

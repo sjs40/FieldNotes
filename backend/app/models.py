@@ -58,10 +58,13 @@ class CallEvent(Base):
     __tablename__ = "call_events"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"), index=True)
+    tracked_call_id: Mapped[str | None] = mapped_column(ForeignKey("tracked_calls.id"), index=True, nullable=True)
     event_type: Mapped[str] = mapped_column(String(32))
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
     snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    __table_args__ = (UniqueConstraint("tracked_call_id", "idempotency_key", name="uq_call_event_idempotency"),)
 
 
 # Phase 2 normalized journal domain. Existing metadata_json is retained only as
