@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -66,6 +67,21 @@ class NormalizedReadApiTests(unittest.TestCase):
         self.assertEqual(response.json()["calls"][0]["symbol"], "AAPL")
         revisions = self.client.get(f"/api/notes/{self.note.id}/revisions").json()
         self.assertEqual([item["revision_number"] for item in revisions], [2, 1])
+
+    @patch("backend.app.main.YFinanceMarketDataProvider")
+    def test_close_is_idempotent_and_freezes_final_return(self, provider_class):
+        provider = provider_class.return_value
+        provider.get_latest_quote.side_effect = lambda symbol: Quote(symbol=symbol, price={"AAPL": 220, "SPY": 510}[symbol], timestamp=datetime(2026, 7, 24, tzinfo=timezone.utc), provider="test")
+        call_id = self.client.get("/api/calls").json()[0]["call"]["id"]
+        payload = {"explanation": "Thesis played out", "idempotency_key": "close-call-0001"}
+        closed = self.client.post(f"/api/calls/{call_id}/closed", json=payload)
+        self.assertEqual(closed.status_code, 200)
+        replay = self.client.post(f"/api/calls/{call_id}/closed", json=payload)
+        self.assertEqual(replay.status_code, 200)
+        self.assertTrue(replay.json()["idempotent_replay"])
+        returns = self.client.get(f"/api/calls/{call_id}/returns").json()
+        self.assertEqual(returns["status"], "closed")
+        self.assertEqual(returns["directional_return"], 0.1)
 
 
 if __name__ == "__main__":
