@@ -77,8 +77,8 @@ def record_frontend_note(session: Session, incoming: dict) -> Note:
 
 @app.on_event("startup")
 def bootstrap() -> None:
-    # Local convenience only. Production schema changes run explicitly through
-    # `alembic upgrade head`, never during a cold start.
+    # Local convenience only. Production migrations run once as part of the
+    # Vercel build, before this release is allowed to serve traffic.
     if not settings.is_production:
         Base.metadata.create_all(engine)
     elif not settings.authentication_enabled:

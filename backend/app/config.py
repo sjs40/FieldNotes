@@ -1,16 +1,16 @@
 from pathlib import Path
 import os
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    database_url: str = Field(default_factory=lambda: os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or f"sqlite:///{Path(__file__).parents[2] / 'fieldnotes.db'}")
+    database_url: str = Field(default=f"sqlite:///{Path(__file__).parents[2] / 'fieldnotes.db'}", validation_alias=AliasChoices("DATABASE_URL", "POSTGRES_URL"))
     quote_cache_minutes: int = 15
     default_benchmark: str = "SPY"
     allow_yfinance: bool = True
-    supabase_url: str | None = Field(default_factory=lambda: os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL"))
-    supabase_publishable_key: str | None = Field(default_factory=lambda: os.getenv("SUPABASE_PUBLISHABLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY"))
+    supabase_url: str | None = Field(default=None, validation_alias=AliasChoices("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL"))
+    supabase_publishable_key: str | None = Field(default=None, validation_alias=AliasChoices("SUPABASE_PUBLISHABLE_KEY", "SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"))
 
     @property
     def is_production(self) -> bool:
@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()
