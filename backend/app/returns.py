@@ -46,6 +46,10 @@ def canonical_return_object(*, call_id: str, status: str, call_type: str, legs: 
     """
     terminal = status in {"closed", "invalidated"}
     timestamp = as_of or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=timezone.utc)
     selected = []
     for leg in legs:
         price = leg.get("exit") if terminal else leg.get("current")
