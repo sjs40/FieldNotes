@@ -246,6 +246,18 @@ async def list_tickers(user: CurrentUser = Depends(get_current_user), session: S
     return [{"symbol": symbol, "notes": notes, "open_calls": open_call_counts.get(symbol, 0), "first_mentioned_at": first.isoformat() if first else None} for symbol, notes, first in rows]
 
 
+@app.get("/api/tickers/{symbol}")
+async def ticker_detail(symbol: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    security = session.scalar(select(Security).where(Security.symbol == symbol.upper()))
+    if not security:
+        raise HTTPException(status_code=404, detail="Ticker not found")
+    notes = session.scalars(select(Note).join(NoteSecurityMention, NoteSecurityMention.note_id == Note.id).where(Note.user_id == user.id, NoteSecurityMention.security_id == security.id).order_by(Note.created_at.desc())).all()
+    calls = session.scalars(select(TrackedCall).join(TrackedCallLeg, TrackedCallLeg.tracked_call_id == TrackedCall.id).where(TrackedCall.user_id == user.id, TrackedCallLeg.security_id == security.id).order_by(TrackedCall.opened_at.desc())).all()
+    quote = session.scalar(select(SecurityPrice).where(SecurityPrice.security_id == security.id).order_by(SecurityPrice.timestamp.desc()).limit(1))
+    events = session.scalars(select(CallEvent).join(TrackedCall, TrackedCall.id == CallEvent.tracked_call_id).join(TrackedCallLeg, TrackedCallLeg.tracked_call_id == TrackedCall.id).where(TrackedCall.user_id == user.id, TrackedCallLeg.security_id == security.id).order_by(CallEvent.occurred_at.desc())).all()
+    return {"symbol": security.symbol, "company_name": security.company_name, "quote": {"price": float(quote.raw_price), "timestamp": quote.timestamp.isoformat(), "basis": quote.price_type} if quote else None, "notes": [serialized_note(session, note) for note in notes], "calls": [{"call": serialize_call(session, call), "returns": call_return_object(session, call)} for call in calls], "timeline": [{"type": event.event_type, "occurred_at": event.occurred_at.isoformat(), "explanation": event.explanation, "call_id": event.tracked_call_id} for event in events]}
+
+
 @app.post("/api/notes/import-legacy")
 @app.post("/api/notes/sync", deprecated=True)
 def import_legacy_notes(payload: SyncRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
