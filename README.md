@@ -11,7 +11,7 @@ Double-click [Start Fieldnotes.bat](<Start Fieldnotes.bat>) in Windows Explorer.
 1. Install backend dependencies:
 
    ```powershell
-   python -m pip install -r backend\requirements.txt
+   python -m pip install -r requirements.txt
    ```
 
 2. Start the application from the repository root:
