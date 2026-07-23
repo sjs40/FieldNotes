@@ -1,0 +1,10 @@
+/* Compact, readable preview text in the recent-notes feed. */
+.note-row p {
+  line-height: 1.45;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}

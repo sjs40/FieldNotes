@@ -1,0 +1,17 @@
+# Python and local runtime data
+__pycache__/
+*.py[cod]
+.venv/
+.yfinance-cache/
+fieldnotes.db
+
+# Environment and editor files
+.env
+.vscode/
+.idea/
+
+# Node and OS files
+node_modules/
+dist/
+Thumbs.db
+.DS_Store

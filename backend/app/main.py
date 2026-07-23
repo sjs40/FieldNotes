@@ -1,0 +1,240 @@
+from datetime import datetime, timezone
+from pathlib import Path
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from .database import Base, engine, get_session
+from .models import CallEvent, Note, Security, SecurityPrice, Tag
+from .parser import parse_note
+from .market_data import YFinanceMarketDataProvider
+
+app = FastAPI(title="Fieldnotes API", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
+
+
+class ParseRequest(BaseModel):
+    body: str
+    note_type: str = "note"
+
+
+class SyncRequest(BaseModel):
+    notes: list[dict]
+
+
+class PublishRequest(BaseModel):
+    body: str
+    note_type: str = "note"
+    title: str = ""
+
+
+class LifecycleRequest(BaseModel):
+    explanation: str = Field(min_length=1)
+
+
+class RefreshRequest(BaseModel):
+    symbols: list[str] = []
+
+
+class BackfillRequest(BaseModel):
+    notes: list[dict]
+
+
+def serialized_note(note: Note) -> dict:
+    result = dict(note.metadata_json.get("frontend", {}))
+    result.update({"id": note.id, "type": note.type, "title": note.title or "", "body": note.body, "status": note.status})
+    return result
+
+
+def record_frontend_note(session: Session, incoming: dict) -> Note:
+    note = session.get(Note, str(incoming.get("id"))) if incoming.get("id") else None
+    parsed = parse_note(incoming.get("body", ""), incoming.get("type", "note"))
+    if note is None:
+        note = Note()
+        if incoming.get("id"):
+            note.id = str(incoming["id"])
+        session.add(note)
+    note.type = parsed["note_type"]
+    note.title = incoming.get("title") or None
+    note.body = parsed["clean_body"]
+    note.status = incoming.get("status", "published")
+    note.published_at = note.published_at or datetime.now(timezone.utc)
+    note.metadata_json = {"frontend": {**incoming, "type": note.type, "body": note.body, "tags": parsed["tags"], "tickers": parsed["ticker_mentions"]}}
+    for tag_name in parsed["tags"]:
+        existing = session.scalar(select(Tag).where(Tag.normalized_name == tag_name.lower()))
+        if not existing:
+            session.add(Tag(normalized_name=tag_name.lower(), display_name=tag_name))
+    for symbol in parsed["ticker_mentions"] + ["SPY"]:
+        existing = session.scalar(select(Security).where(Security.symbol == symbol))
+        if not existing:
+            session.add(Security(symbol=symbol))
+    return note
+
+
+@app.on_event("startup")
+def bootstrap() -> None:
+    Base.metadata.create_all(engine)
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "provider": "yfinance"}
+
+
+@app.post("/api/notes/parse")
+def parse(payload: ParseRequest):
+    return parse_note(payload.body, payload.note_type)
+
+
+@app.get("/api/notes")
+def list_notes(session: Session = Depends(get_session)):
+    return [serialized_note(note) for note in session.scalars(select(Note).order_by(Note.created_at.desc())).all()]
+
+
+@app.post("/api/notes/sync")
+def sync_notes(payload: SyncRequest, session: Session = Depends(get_session)):
+    for incoming in payload.notes:
+        record_frontend_note(session, incoming)
+    session.commit()
+    return {"notes": [serialized_note(note) for note in session.scalars(select(Note).order_by(Note.created_at.desc())).all()]}
+
+
+@app.post("/api/notes/publish")
+def publish_note(payload: PublishRequest, session: Session = Depends(get_session)):
+    """Create every explicitly requested tracker with a backend-captured quote.
+
+    Calls are never created without a reference quote; ordinary notes remain
+    publishable even if the market-data provider is unavailable.
+    """
+    parsed = parse_note(payload.body, payload.note_type)
+    if parsed["errors"] or parsed["warnings"]:
+        raise HTTPException(status_code=422, detail={"errors": parsed["errors"], "warnings": parsed["warnings"]})
+    provider = YFinanceMarketDataProvider()
+    calls, quote_failures = [], {}
+    symbols = {"SPY"}
+    for call in parsed["tracked_calls"]:
+        symbols.update([call.get("symbol"), call.get("long"), call.get("short")])
+    symbols.discard(None)
+    quotes = {}
+    for symbol in symbols:
+        try:
+            quote = provider.get_latest_quote(symbol)
+            quotes[symbol] = {"price": quote.price, "timestamp": quote.timestamp.isoformat(), "basis": quote.price_type, "provider": quote.provider}
+        except Exception as exc:
+            quote_failures[symbol] = str(exc)
+    if parsed["tracked_calls"] and quote_failures:
+        raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
+    opened = datetime.now(timezone.utc)
+    for request_call in parsed["tracked_calls"]:
+        if request_call["type"] == "long_short":
+            calls.append({"id": str(__import__('uuid').uuid4()), "type": "long_short", "status": "open", "opened": opened.strftime("%b %d, %Y"), "long": {"symbol": request_call["long"], "entry": quotes[request_call["long"]]["price"], "current": quotes[request_call["long"]]["price"]}, "short": {"symbol": request_call["short"], "entry": quotes[request_call["short"]]["price"], "current": quotes[request_call["short"]]["price"]}, "entryQuoteAt": opened.isoformat(), "priceBasis": quotes[request_call["long"]]["basis"]})
+        else:
+            symbol = request_call["symbol"]
+            calls.append({"id": str(__import__('uuid').uuid4()), "type": request_call["type"], "symbol": symbol, "status": "open", "opened": opened.strftime("%b %d, %Y"), "entry": quotes[symbol]["price"], "current": quotes[symbol]["price"], "spyEntry": quotes["SPY"]["price"], "spyCurrent": quotes["SPY"]["price"], "entryQuoteAt": opened.isoformat(), "priceBasis": quotes[symbol]["basis"]})
+    frontend = {"id": str(__import__('uuid').uuid4()), "type": parsed["note_type"], "title": payload.title, "body": parsed["clean_body"], "tags": parsed["tags"], "tickers": parsed["ticker_mentions"], "date": opened.strftime("%b %d, %Y"), "time": opened.astimezone().strftime("%I:%M %p").lstrip("0"), "status": "published", "calls": calls}
+    if len(calls) == 1:
+        frontend["call"] = calls[0]  # compatibility with pre-migration records
+    note = record_frontend_note(session, frontend)
+    session.flush()  # assign the UUID before call events reference this note
+    for call in calls:
+        session.add(CallEvent(note_id=note.id, event_type="opened", snapshot_json={"call": call, "benchmark": quotes.get("SPY")}))
+    session.commit()
+    return serialized_note(note)
+
+
+@app.post("/api/capture")
+def capture(payload: ParseRequest, session: Session = Depends(get_session)):
+    parsed = parse_note(payload.body, payload.note_type)
+    note = record_frontend_note(session, {"type": parsed["note_type"], "body": parsed["clean_body"], "status": "draft", "tags": parsed["tags"], "tickers": parsed["ticker_mentions"]})
+    session.commit()
+    return {"note": serialized_note(note), "parse": parsed}
+
+
+@app.post("/api/market-data/refresh")
+def refresh(payload: RefreshRequest, session: Session = Depends(get_session)):
+    symbols = {symbol.upper() for symbol in payload.symbols} or {row[0] for row in session.execute(select(Security.symbol)).all()}
+    symbols.add("SPY")
+    provider = YFinanceMarketDataProvider()
+    quotes = {}
+    failures = {}
+    for symbol in sorted(symbols):
+        try:
+            quote = provider.get_latest_quote(symbol)
+            security = session.scalar(select(Security).where(Security.symbol == symbol))
+            if not security:
+                security = Security(symbol=symbol)
+                session.add(security)
+                session.flush()
+            session.add(SecurityPrice(security_id=security.id, timestamp=quote.timestamp, raw_price=quote.price, adjusted_price=quote.price, price_type=quote.price_type, provider=quote.provider))
+            quotes[symbol] = {"price": quote.price, "timestamp": quote.timestamp.isoformat(), "basis": quote.price_type, "provider": quote.provider}
+        except Exception as exc:
+            failures[symbol] = str(exc)
+    session.commit()
+    if not quotes:
+        raise HTTPException(status_code=503, detail={"message": "No quotes could be retrieved.", "failures": failures})
+    return {"quotes": quotes, "failures": failures}
+
+
+@app.post("/api/market-data/backfill-legacy")
+def backfill_legacy_entries(payload: BackfillRequest):
+    """Replace pre-backend demo entries with auditable historical closes."""
+    provider = YFinanceMarketDataProvider()
+    failures = []
+    for note in payload.notes:
+        for call in note.get("calls") or ([note["call"]] if note.get("call") else []):
+            if call.get("entryQuoteAt"):
+                continue
+            try:
+                date_text = call.get("opened") or note.get("date")
+                if call.get("type") == "long_short":
+                    for leg_name in ("long", "short"):
+                        leg = call[leg_name]
+                        quote = provider.get_historical_close(leg["symbol"], date_text)
+                        leg["entry"] = quote.price
+                    call["priceBasis"] = "historical_close"
+                else:
+                    quote = provider.get_historical_close(call["symbol"], date_text)
+                    spy = provider.get_historical_close("SPY", date_text)
+                    call["entry"] = quote.price
+                    call["spyEntry"] = spy.price
+                    call["priceBasis"] = "historical_close"
+                call["entryQuoteAt"] = f"{date_text} regular-session close"
+                call.pop("unverified", None)
+            except Exception as exc:
+                failures.append({"note": note.get("id"), "call": call.get("symbol", call.get("type")), "error": str(exc)})
+    return {"notes": payload.notes, "failures": failures}
+
+
+@app.post("/api/calls/{note_id}/{event_type}")
+def lifecycle(note_id: str, event_type: str, payload: LifecycleRequest, session: Session = Depends(get_session)):
+    if event_type not in {"updated", "closed", "reversed", "invalidated"}:
+        raise HTTPException(status_code=422, detail="Unsupported lifecycle event")
+    note = session.get(Note, note_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    call = note.metadata_json.get("frontend", {}).get("call")
+    if not call:
+        raise HTTPException(status_code=422, detail="This note has no tracked call")
+    if event_type in {"closed", "invalidated", "reversed"}:
+        call["status"] = "invalidated" if event_type == "invalidated" else "closed"
+    note.metadata_json["frontend"]["call"] = call
+    session.add(CallEvent(note_id=note.id, event_type=event_type, explanation=payload.explanation, snapshot_json={"call": call}))
+    session.commit()
+    return serialized_note(note)
+
+
+@app.get("/api/export/calls.csv")
+def export_calls(session: Session = Depends(get_session)):
+    rows = ["Call,Type,Status,Opened,Entry,Current"]
+    for note in session.scalars(select(Note)).all():
+        call = note.metadata_json.get("frontend", {}).get("call")
+        if call:
+            symbol = call.get("symbol") or f"{call['long']['symbol']}/{call['short']['symbol']}"
+            rows.append(f"{symbol},{call.get('type','')},{call.get('status','')},{call.get('opened','')},{call.get('entry','')},{call.get('current','')}")
+    return "\n".join(rows)
+
+
+web_root = Path(__file__).parents[2]
+app.mount("/", StaticFiles(directory=web_root, html=True), name="web")
