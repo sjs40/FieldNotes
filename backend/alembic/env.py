@@ -1,19 +1,21 @@
 from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
-from backend.app.config import settings
-from backend.app.database import Base
+from backend.app.database import Base, database_url
 import backend.app.models  # noqa: F401 - registers metadata
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# ConfigParser treats percent signs as interpolation markers. Supabase URLs
+# correctly percent-encode password characters, so escape only for Alembic's
+# config layer; SQLAlchemy receives the original value when it is read back.
+config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 if config.config_file_name:
     fileConfig(config.config_file_name)
 target_metadata = Base.metadata
 
 
 def run_migrations_offline():
-    context.configure(url=settings.database_url, target_metadata=target_metadata, literal_binds=True, compare_type=True)
+    context.configure(url=database_url, target_metadata=target_metadata, literal_binds=True, compare_type=True)
     with context.begin_transaction(): context.run_migrations()
 
 
