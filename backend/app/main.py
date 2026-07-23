@@ -12,6 +12,7 @@ from .models import CallEvent, Note, Security, SecurityPrice, Tag
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
+from .journal import create_note, serialize_note as serialize_journal_note
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
@@ -53,10 +54,8 @@ class BackfillRequest(BaseModel):
     notes: list[dict]
 
 
-def serialized_note(note: Note) -> dict:
-    result = dict(note.metadata_json.get("frontend", {}))
-    result.update({"id": note.id, "type": note.type, "title": note.title or "", "body": note.body, "status": note.status})
-    return result
+def serialized_note(session: Session, note: Note) -> dict:
+    return serialize_journal_note(session, note)
 
 
 def record_frontend_note(session: Session, incoming: dict) -> Note:
@@ -119,7 +118,7 @@ def parse(payload: ParseRequest):
 
 @app.get("/api/notes")
 async def list_notes(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
-    return [serialized_note(note) for note in session.scalars(select(Note).where(Note.user_id == user.id).order_by(Note.created_at.desc())).all()]
+    return [serialized_note(session, note) for note in session.scalars(select(Note).where(Note.user_id == user.id).order_by(Note.created_at.desc())).all()]
 
 
 @app.post("/api/notes/sync")
@@ -127,7 +126,7 @@ def sync_notes(payload: SyncRequest, session: Session = Depends(get_session)):
     for incoming in payload.notes:
         record_frontend_note(session, incoming)
     session.commit()
-    return {"notes": [serialized_note(note) for note in session.scalars(select(Note).order_by(Note.created_at.desc())).all()]}
+    return {"notes": [serialized_note(session, note) for note in session.scalars(select(Note).order_by(Note.created_at.desc())).all()]}
 
 
 @app.post("/api/notes/publish")
@@ -141,7 +140,7 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
     if parsed["errors"] or parsed["warnings"]:
         raise HTTPException(status_code=422, detail={"errors": parsed["errors"], "warnings": parsed["warnings"]})
     provider = YFinanceMarketDataProvider()
-    calls, quote_failures = [], {}
+    quote_failures = {}
     symbols = {"SPY"}
     for call in parsed["tracked_calls"]:
         symbols.update([call.get("symbol"), call.get("long"), call.get("short")])
@@ -150,28 +149,14 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
     for symbol in symbols:
         try:
             quote = provider.get_latest_quote(symbol)
-            quotes[symbol] = {"price": quote.price, "timestamp": quote.timestamp.isoformat(), "basis": quote.price_type, "provider": quote.provider}
+            quotes[symbol] = quote
         except Exception as exc:
             quote_failures[symbol] = str(exc)
     if parsed["tracked_calls"] and quote_failures:
         raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
-    opened = datetime.now(timezone.utc)
-    for request_call in parsed["tracked_calls"]:
-        if request_call["type"] == "long_short":
-            calls.append({"id": str(__import__('uuid').uuid4()), "type": "long_short", "status": "open", "opened": opened.strftime("%b %d, %Y"), "long": {"symbol": request_call["long"], "entry": quotes[request_call["long"]]["price"], "current": quotes[request_call["long"]]["price"]}, "short": {"symbol": request_call["short"], "entry": quotes[request_call["short"]]["price"], "current": quotes[request_call["short"]]["price"]}, "entryQuoteAt": opened.isoformat(), "priceBasis": quotes[request_call["long"]]["basis"]})
-        else:
-            symbol = request_call["symbol"]
-            calls.append({"id": str(__import__('uuid').uuid4()), "type": request_call["type"], "symbol": symbol, "status": "open", "opened": opened.strftime("%b %d, %Y"), "entry": quotes[symbol]["price"], "current": quotes[symbol]["price"], "spyEntry": quotes["SPY"]["price"], "spyCurrent": quotes["SPY"]["price"], "entryQuoteAt": opened.isoformat(), "priceBasis": quotes[symbol]["basis"]})
-    frontend = {"id": str(__import__('uuid').uuid4()), "type": parsed["note_type"], "title": payload.title, "body": parsed["clean_body"], "tags": parsed["tags"], "tickers": parsed["ticker_mentions"], "date": opened.strftime("%b %d, %Y"), "time": opened.astimezone().strftime("%I:%M %p").lstrip("0"), "status": "published", "calls": calls}
-    if len(calls) == 1:
-        frontend["call"] = calls[0]  # compatibility with pre-migration records
-    note = record_frontend_note(session, frontend)
-    note.user_id = user.id
-    session.flush()  # assign the UUID before call events reference this note
-    for call in calls:
-        session.add(CallEvent(note_id=note.id, event_type="opened", snapshot_json={"call": call, "benchmark": quotes.get("SPY")}))
+    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published", quotes=quotes)
     session.commit()
-    return serialized_note(note)
+    return serialized_note(session, note)
 
 
 @app.post("/api/capture")
@@ -179,7 +164,7 @@ def capture(payload: ParseRequest, session: Session = Depends(get_session)):
     parsed = parse_note(payload.body, payload.note_type)
     note = record_frontend_note(session, {"type": parsed["note_type"], "body": parsed["clean_body"], "status": "draft", "tags": parsed["tags"], "tickers": parsed["ticker_mentions"]})
     session.commit()
-    return {"note": serialized_note(note), "parse": parsed}
+    return {"note": serialized_note(session, note), "parse": parsed}
 
 
 @app.post("/api/market-data/refresh")
@@ -252,7 +237,7 @@ def lifecycle(note_id: str, event_type: str, payload: LifecycleRequest, session:
     note.metadata_json["frontend"]["call"] = call
     session.add(CallEvent(note_id=note.id, event_type=event_type, explanation=payload.explanation, snapshot_json={"call": call}))
     session.commit()
-    return serialized_note(note)
+    return serialized_note(session, note)
 
 
 @app.get("/api/export/calls.csv")
