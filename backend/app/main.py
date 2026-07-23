@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import CallEvent, Note, Security, SecurityPrice, Tag
+from .models import CallBenchmarkSnapshot, CallEvent, Note, Security, SecurityPrice, Tag, TrackedCall, TrackedCallLeg
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -121,12 +121,24 @@ async def list_notes(user: CurrentUser = Depends(get_current_user), session: Ses
     return [serialized_note(session, note) for note in session.scalars(select(Note).where(Note.user_id == user.id).order_by(Note.created_at.desc())).all()]
 
 
-@app.post("/api/notes/sync")
-def sync_notes(payload: SyncRequest, session: Session = Depends(get_session)):
-    for incoming in payload.notes:
-        record_frontend_note(session, incoming)
+@app.post("/api/notes")
+async def create_draft(payload: PublishRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    parsed = parse_note(payload.body, payload.note_type)
+    if parsed["errors"]:
+        raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
+    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="draft")
     session.commit()
-    return {"notes": [serialized_note(session, note) for note in session.scalars(select(Note).order_by(Note.created_at.desc())).all()]}
+    return serialized_note(session, note)
+
+
+@app.post("/api/notes/sync")
+def sync_notes(payload: SyncRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Legacy-only import bridge; new browser writes use individual note APIs."""
+    for incoming in payload.notes:
+        note = record_frontend_note(session, incoming)
+        note.user_id = user.id
+    session.commit()
+    return {"notes": [serialized_note(session, note) for note in session.scalars(select(Note).where(Note.user_id == user.id).order_by(Note.created_at.desc())).all()]}
 
 
 @app.post("/api/notes/publish")
@@ -168,8 +180,21 @@ def capture(payload: ParseRequest, session: Session = Depends(get_session)):
 
 
 @app.post("/api/market-data/refresh")
-def refresh(payload: RefreshRequest, session: Session = Depends(get_session)):
-    symbols = {symbol.upper() for symbol in payload.symbols} or {row[0] for row in session.execute(select(Security.symbol)).all()}
+def refresh(payload: RefreshRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    symbols = {symbol.upper() for symbol in payload.symbols}
+    if not symbols:
+        symbols = set(session.scalars(
+            select(Security.symbol)
+            .join(TrackedCallLeg, TrackedCallLeg.security_id == Security.id)
+            .join(TrackedCall, TrackedCall.id == TrackedCallLeg.tracked_call_id)
+            .where(TrackedCall.user_id == user.id, TrackedCall.status == "open")
+        ).all())
+        symbols.update(session.scalars(
+            select(Security.symbol)
+            .join(CallBenchmarkSnapshot, CallBenchmarkSnapshot.benchmark_security_id == Security.id)
+            .join(TrackedCall, TrackedCall.id == CallBenchmarkSnapshot.tracked_call_id)
+            .where(TrackedCall.user_id == user.id, TrackedCall.status == "open")
+        ).all())
     symbols.add("SPY")
     provider = YFinanceMarketDataProvider()
     quotes = {}
