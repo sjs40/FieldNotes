@@ -8,7 +8,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import CallBenchmarkSnapshot, CallEvent, Note, NoteRelationship, NoteRevision, NoteSecurityMention, Security, SecurityPrice, Tag, TrackedCall, TrackedCallLeg
+from .models import CallBenchmarkSnapshot, CallEvent, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteTag, Security, SecurityPrice, Tag, TrackedCall, TrackedCallLeg
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -127,8 +127,16 @@ def parse(payload: ParseRequest):
 
 
 @app.get("/api/notes")
-async def list_notes(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
-    return [serialized_note(session, note) for note in session.scalars(select(Note).where(Note.user_id == user.id).order_by(Note.created_at.desc())).all()]
+async def list_notes(note_type: str | None = None, status: str | None = None, ticker: str | None = None, tag: str | None = None, has_call: bool | None = None, limit: int = 100, offset: int = 0, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    statement = select(Note).where(Note.user_id == user.id)
+    if note_type: statement = statement.where(Note.type == note_type)
+    if status: statement = statement.where(Note.status == status)
+    if ticker: statement = statement.join(NoteSecurityMention, NoteSecurityMention.note_id == Note.id).join(Security, Security.id == NoteSecurityMention.security_id).where(Security.symbol == ticker.upper())
+    if tag: statement = statement.join(NoteTag, NoteTag.note_id == Note.id).join(Tag, Tag.id == NoteTag.tag_id).where(Tag.normalized_name == tag.lower())
+    if has_call is True: statement = statement.where(select(TrackedCall.id).where(TrackedCall.originating_note_id == Note.id).exists())
+    if has_call is False: statement = statement.where(~select(TrackedCall.id).where(TrackedCall.originating_note_id == Note.id).exists())
+    notes = session.scalars(statement.distinct().order_by(Note.created_at.desc()).offset(max(0, offset)).limit(min(max(1, limit), 200))).all()
+    return [serialized_note(session, note) for note in notes]
 
 
 @app.post("/api/notes")
