@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
+from .config import settings
 from .models import CallEvent, Note, Security, SecurityPrice, Tag
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
@@ -75,7 +76,10 @@ def record_frontend_note(session: Session, incoming: dict) -> Note:
 
 @app.on_event("startup")
 def bootstrap() -> None:
-    Base.metadata.create_all(engine)
+    # Local convenience only. Production schema changes run explicitly through
+    # `alembic upgrade head`, never during a cold start.
+    if not settings.is_production:
+        Base.metadata.create_all(engine)
 
 
 @app.get("/api/health")

@@ -34,6 +34,19 @@ The first page load syncs the notes already stored by the previous browser-only 
 
 SQLite is used for frictionless single-user local development. `docker-compose.yml` provides PostgreSQL and Redis for the next stage: Alembic migrations, worker-based quote refresh, ingestion, and AI enrichment.
 
+## Production database and migrations
+
+Set `ENVIRONMENT=production` and a managed PostgreSQL `DATABASE_URL` (for
+example Neon or Supabase). SQLite is intentionally rejected in production.
+Run schema migrations explicitly during deployment:
+
+```powershell
+alembic upgrade head
+```
+
+The Vercel entry point is `api/index.py`; `vercel.json` routes API requests to
+that FastAPI application. Do not commit `.env`, database files, or credentials.
+
 ## Checks
 
 ```powershell
