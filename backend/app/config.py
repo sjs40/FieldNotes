@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     @property
     def is_production(self) -> bool:
-        return os.getenv("ENVIRONMENT", "development").lower() == "production"
+        return os.getenv("ENVIRONMENT", "development").lower() == "production" or os.getenv("VERCEL_ENV", "").lower() == "production"
 
     @property
     def authentication_enabled(self) -> bool:
