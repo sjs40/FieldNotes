@@ -11,6 +11,7 @@ from .config import settings
 from .models import CallEvent, Note, Security, SecurityPrice, Tag
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
+from .auth import CurrentUser, get_current_user
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
@@ -80,11 +81,18 @@ def bootstrap() -> None:
     # `alembic upgrade head`, never during a cold start.
     if not settings.is_production:
         Base.metadata.create_all(engine)
+    elif not settings.authentication_enabled:
+        raise RuntimeError("Supabase authentication must be configured in production")
 
 
 @app.get("/api/health")
 def health():
     return {"status": "ok", "provider": "yfinance"}
+
+
+@app.get("/api/auth/me")
+async def current_user(user: CurrentUser = Depends(get_current_user)):
+    return {"id": user.id, "email": user.email, "display_name": user.display_name}
 
 
 @app.post("/api/notes/parse")
@@ -93,8 +101,8 @@ def parse(payload: ParseRequest):
 
 
 @app.get("/api/notes")
-def list_notes(session: Session = Depends(get_session)):
-    return [serialized_note(note) for note in session.scalars(select(Note).order_by(Note.created_at.desc())).all()]
+async def list_notes(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    return [serialized_note(note) for note in session.scalars(select(Note).where(Note.user_id == user.id).order_by(Note.created_at.desc())).all()]
 
 
 @app.post("/api/notes/sync")
@@ -106,7 +114,7 @@ def sync_notes(payload: SyncRequest, session: Session = Depends(get_session)):
 
 
 @app.post("/api/notes/publish")
-def publish_note(payload: PublishRequest, session: Session = Depends(get_session)):
+async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     """Create every explicitly requested tracker with a backend-captured quote.
 
     Calls are never created without a reference quote; ordinary notes remain
@@ -141,6 +149,7 @@ def publish_note(payload: PublishRequest, session: Session = Depends(get_session
     if len(calls) == 1:
         frontend["call"] = calls[0]  # compatibility with pre-migration records
     note = record_frontend_note(session, frontend)
+    note.user_id = user.id
     session.flush()  # assign the UUID before call events reference this note
     for call in calls:
         session.add(CallEvent(note_id=note.id, event_type="opened", snapshot_json={"call": call, "benchmark": quotes.get("SPY")}))
