@@ -354,6 +354,8 @@ def lifecycle(call_id: str, event_type: str, payload: LifecycleRequest, user: Cu
         parsed = parse_note(payload.body, "note")
         if parsed["errors"]:
             raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
+        if parsed["tracked_calls"]:
+            raise HTTPException(status_code=422, detail="Updates cannot open a new tracked call. Publish a separate note to create one.")
         update_note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published")
         session.add(NoteRelationship(from_note_id=update_note.id, to_note_id=call.originating_note_id, relationship_type="update_of"))
         event_note_id = update_note.id
