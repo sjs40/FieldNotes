@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     quote_cache_minutes: int = 15
     default_benchmark: str = "SPY"
     allow_yfinance: bool = True
-    supabase_url: str | None = Field(default_factory=lambda: os.getenv("SUPABASE_URL"))
-    supabase_publishable_key: str | None = Field(default_factory=lambda: os.getenv("SUPABASE_PUBLISHABLE_KEY") or os.getenv("SUPABASE_ANON_KEY"))
+    supabase_url: str | None = Field(default_factory=lambda: os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL"))
+    supabase_publishable_key: str | None = Field(default_factory=lambda: os.getenv("SUPABASE_PUBLISHABLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY"))
 
     @property
     def is_production(self) -> bool:
