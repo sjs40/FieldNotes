@@ -182,3 +182,77 @@ class NoteRelationship(Base):
     to_note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"), index=True)
     relationship_type: Mapped[str] = mapped_column(String(32), default="update_of")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class ThesisDetails(Base):
+    __tablename__ = "thesis_details"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"), unique=True, index=True)
+    core_thesis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    key_evidence_json: Mapped[list] = mapped_column(JSON, default=list)
+    catalysts_json: Mapped[list] = mapped_column(JSON, default=list)
+    risks_json: Mapped[list] = mapped_column(JSON, default=list)
+    invalidation_conditions_json: Mapped[list] = mapped_column(JSON, default=list)
+    valuation_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expected_time_horizon_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class CallExpectation(Base):
+    __tablename__ = "call_expectations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tracked_call_id: Mapped[str] = mapped_column(ForeignKey("tracked_calls.id"), index=True)
+    target_type: Mapped[str] = mapped_column(String(32))
+    target_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    target_unit: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    expected_return: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    time_horizon_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    catalyst_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class BrokerageConnection(Base):
+    __tablename__ = "brokerage_connections"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    provider: Mapped[str] = mapped_column(String(32), default="ibkr")
+    display_name: Mapped[str] = mapped_column(String(255), default="Interactive Brokers")
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class BrokerageAccount(Base):
+    __tablename__ = "brokerage_accounts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    connection_id: Mapped[str] = mapped_column(ForeignKey("brokerage_connections.id"), index=True)
+    external_account_id_hash: Mapped[str] = mapped_column(String(128), index=True)
+    display_name: Mapped[str] = mapped_column(String(255))
+    account_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    base_currency: Mapped[str] = mapped_column(String(8), default="USD")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("connection_id", "external_account_id_hash", name="uq_brokerage_account_external"),)
+
+
+class PortfolioPosition(Base):
+    __tablename__ = "portfolio_positions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    brokerage_account_id: Mapped[str] = mapped_column(ForeignKey("brokerage_accounts.id"), index=True)
+    security_id: Mapped[str] = mapped_column(ForeignKey("securities.id"), index=True)
+    external_contract_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    quantity: Mapped[float] = mapped_column(Numeric(20, 6))
+    average_cost: Mapped[float | None] = mapped_column(Numeric(20, 6), nullable=True)
+    market_price: Mapped[float | None] = mapped_column(Numeric(20, 6), nullable=True)
+    market_value: Mapped[float | None] = mapped_column(Numeric(20, 6), nullable=True)
+    unrealized_pnl: Mapped[float | None] = mapped_column(Numeric(20, 6), nullable=True)
+    realized_pnl: Mapped[float | None] = mapped_column(Numeric(20, 6), nullable=True)
+    currency: Mapped[str] = mapped_column(String(8), default="USD")
+    snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)

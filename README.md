@@ -64,13 +64,18 @@ Set `ENVIRONMENT=production`, a managed PostgreSQL `DATABASE_URL` (for example
 Supabase), `SUPABASE_URL`, and a publishable Supabase key. SQLite is
 intentionally rejected in production.
 
-The application runs committed Alembic revisions during production startup
-before serving requests; migrations are transactional and recorded in
-`alembic_version`. To run migrations explicitly in a trusted environment:
+Application startup never runs migrations. Run them explicitly in a trusted
+environment; production requires an intentional confirmation:
 
 ```powershell
-alembic upgrade head
+python -m backend.scripts.run_migrations
+# production only: $env:FIELDNOTES_CONFIRM_MIGRATIONS='yes'
 ```
+
+Inspect a revision with `alembic current`; rollback with `alembic downgrade -1`
+after validating the migration is reversible. For previews, migrate the preview
+database before its deployment. Production sequence: `alembic upgrade head`,
+then `vercel deploy --prod`, then check `/api/health/ready`.
 
 The Vercel entry point is `api/index.py`; `vercel.json` rewrites all requests
 to that FastAPI application, which serves both the UI and `/api/*`. Do not
@@ -84,3 +89,10 @@ python -m unittest discover -s backend/tests -v
 node --check app-modern.js
 node --check refresh-prices.js
 ```
+
+## IBKR portfolio foundation
+
+Portfolio ingestion is read-only. Vercel cannot connect to TWS running on your
+Windows machine: a local agent in `integrations/ibkr_sync_agent` pushes HTTPS
+snapshots with a narrowly scoped token. No trading, orders, cancellations, or
+transfers are implemented. Never commit IBKR or sync credentials.

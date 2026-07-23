@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .journal import create_note, serialize_call
+from .journal import _record_quote, call_return_object, create_note, serialize_call
 from .models import CallBenchmarkSnapshot, CallEvent, NoteRelationship, Security, TrackedCall, TrackedCallLeg
 from .parser import parse_note
 
@@ -27,7 +27,7 @@ def _quotes(session: Session, call: TrackedCall, provider):
     return legs, benchmark, {x.id: x for x in securities}, quotes
 
 
-def execute(session: Session, *, call_id: str, user_id: str, event_type: str, explanation: str, idempotency_key: str, provider, body: str | None = None, title: str = "", invalidation_category: str | None = None) -> dict:
+def execute(session: Session, *, call_id: str, user_id: str, event_type: str, explanation: str, idempotency_key: str, provider, body: str | None = None, title: str = "", invalidation_category: str | None = None, confidence_before: str | None = None, confidence_after: str | None = None, thesis_state: str | None = None, allow_snapshot_unavailable: bool = False) -> dict:
     if event_type not in {"updated", "closed", "reversed", "invalidated"}:
         raise HTTPException(422, detail="Unsupported lifecycle event")
     call = session.scalar(select(TrackedCall).where(TrackedCall.id == call_id, TrackedCall.user_id == user_id))
@@ -41,16 +41,31 @@ def execute(session: Session, *, call_id: str, user_id: str, event_type: str, ex
     if event_type == "invalidated" and invalidation_category not in INVALIDATION_CATEGORIES:
         raise HTTPException(422, detail="A valid invalidation category is required")
 
-    # Validate before any writes. Updates deliberately do not need market quotes.
+    if confidence_before not in {None, "low", "medium", "high"} or confidence_after not in {None, "low", "medium", "high"} or thesis_state not in {None, "strengthening", "unchanged", "weakening", "under_review"}:
+        raise HTTPException(422, detail="Invalid optional update metadata")
+    # Validate before any writes. Updates atomically capture required quotes unless explicitly saved without a snapshot.
     if event_type == "updated":
         if not body:
             raise HTTPException(422, detail="Update text is required")
         parsed = parse_note(body, "note")
         if parsed["errors"] or parsed["tracked_calls"]:
             raise HTTPException(422, detail={"errors": parsed["errors"], "message": "Updates cannot open a new tracked call. Publish a separate note to create one."})
+        snapshot = {"tracked_call_id": call.id, "snapshot_status": "available", "confidence_before": confidence_before, "confidence_after": confidence_after, "thesis_state": thesis_state}
+        try:
+            legs, benchmark, securities, quotes = _quotes(session, call, provider)
+            for leg in legs: _record_quote(session, securities[leg.security_id], quotes[leg.security_id])
+            _record_quote(session, securities[benchmark.benchmark_security_id], quotes[benchmark.benchmark_security_id])
+            returns = call_return_object(session, call)
+            opened_at = call.opened_at if call.opened_at.tzinfo else call.opened_at.replace(tzinfo=timezone.utc)
+            snapshot.update({"quotes": {securities[key].symbol: {"price": float(q.price), "timestamp": q.timestamp.isoformat(), "basis": q.price_type, "provider": q.provider} for key, q in quotes.items()}, "returns": returns, "days_since_opening": (datetime.now(timezone.utc) - opened_at).days})
+        except HTTPException as exc:
+            if not allow_snapshot_unavailable:
+                raise
+            snapshot.update({"snapshot_status": "unavailable", "failure_reason": str(exc.detail), "retrieved_at": datetime.now(timezone.utc).isoformat()})
         update = create_note(session, user_id=user_id, parsed=parsed, title=title, status="published")
         session.add(NoteRelationship(from_note_id=update.id, to_note_id=call.originating_note_id, relationship_type="update_of"))
-        session.add(CallEvent(note_id=update.id, tracked_call_id=call.id, event_type="updated", explanation=explanation, idempotency_key=idempotency_key, snapshot_json={"tracked_call_id": call.id, "update_note_id": update.id}))
+        snapshot["update_note_id"] = update.id
+        session.add(CallEvent(note_id=update.id, tracked_call_id=call.id, event_type="updated", explanation=explanation, idempotency_key=idempotency_key, snapshot_json=snapshot))
         session.commit()
         return {"call": serialize_call(session, call), "update_note_id": update.id}
 

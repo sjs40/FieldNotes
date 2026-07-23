@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from .models import (
     CallBenchmarkSnapshot,
+    CallExpectation,
     CallEvent,
     Note,
     NoteRevision,
@@ -84,16 +85,20 @@ def _call_payload(session: Session, call: TrackedCall) -> dict:
     security_by_id = {security.id: security for security in session.scalars(select(Security).where(Security.id.in_([leg.security_id for leg in legs]))).all()}
     opened = call.opened_at.astimezone().strftime("%b %d, %Y") if call.opened_at else ""
     quote_at = legs[0].entry_quote_at.isoformat() if legs else call.opened_at.isoformat()
+    expectation = session.scalar(select(CallExpectation).where(CallExpectation.tracked_call_id == call.id).order_by(CallExpectation.created_at.desc()))
+    expectation_data = {"target": float(expectation.target_value) if expectation and expectation.target_value is not None else None, "target_type": expectation.target_type if expectation else None, "unit": expectation.target_unit if expectation else None} if expectation else None
     if call.call_type == "long_short":
         long_leg, short_leg = legs
-        return {
+        result = {
             "id": call.id, "type": "long_short", "status": call.status, "opened": opened,
             "long": {"symbol": security_by_id[long_leg.security_id].symbol, "entry": float(long_leg.entry_price_raw), "current": _latest_price(session, long_leg.security_id, long_leg.entry_price_raw)},
             "short": {"symbol": security_by_id[short_leg.security_id].symbol, "entry": float(short_leg.entry_price_raw), "current": _latest_price(session, short_leg.security_id, short_leg.entry_price_raw)},
             "entryQuoteAt": quote_at, "priceBasis": long_leg.entry_price_type,
         }
+        if expectation_data: result["expectation"] = expectation_data
+        return result
     leg = legs[0]
-    return {
+    result = {
         "id": call.id, "type": call.call_type, "status": call.status, "opened": opened,
         "symbol": security_by_id[leg.security_id].symbol, "entry": float(leg.entry_price_raw),
         "current": _latest_price(session, leg.security_id, leg.entry_price_raw),
@@ -101,6 +106,16 @@ def _call_payload(session: Session, call: TrackedCall) -> dict:
         "spyCurrent": _latest_price(session, benchmark.benchmark_security_id, benchmark.entry_price_raw),
         "entryQuoteAt": quote_at, "priceBasis": leg.entry_price_type,
     }
+    if expectation_data:
+        result["expectation"] = expectation_data
+        target = expectation_data["target"]
+        if target is not None:
+            entry, current = float(leg.entry_price_raw), _latest_price(session, leg.security_id, leg.entry_price_raw)
+            denominator = (target - entry) if call.call_type == "bull" else (entry - target)
+            progress = ((current - entry) if call.call_type == "bull" else (entry - current)) / denominator if denominator else None
+            result["target_progress"] = progress
+            result["target_status"] = "invalid_relative_to_stance" if denominator <= 0 else ("passed" if progress is not None and progress > 1 else "reached" if progress == 1 else "not_reached")
+    return result
 
 
 def serialize_call(session: Session, call: TrackedCall) -> dict:
@@ -190,6 +205,8 @@ def create_note(
             entry_quote_at=benchmark_quote.timestamp, entry_price_type=benchmark_quote.price_type,
             entry_provider=benchmark_quote.provider,
         ))
+        if request.get("target") is not None:
+            session.add(CallExpectation(tracked_call_id=call.id, target_type=request.get("target_type", "security_price"), target_value=request["target"], target_unit=request.get("target_unit", "USD")))
         session.add(CallEvent(note_id=note.id, event_type="opened", occurred_at=now, snapshot_json={"tracked_call_id": call.id, "source": "api"}))
     return note
 

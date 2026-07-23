@@ -8,3 +8,9 @@
   overflow: hidden;
   overflow-wrap: anywhere;
 }
+
+.thesis-details { margin: 12px 0; color: var(--muted); }
+.thesis-details summary { cursor: pointer; font-weight: 600; }
+.thesis-details label { display: block; margin-top: 9px; font-size: 13px; }
+.thesis-details input, .thesis-details textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px; border: 1px solid #d9d7d0; border-radius: 4px; font: inherit; }
+.thesis-details textarea { min-height: 52px; }

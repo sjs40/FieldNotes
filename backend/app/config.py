@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     allow_yfinance: bool = True
     supabase_url: str | None = Field(default=None, validation_alias=AliasChoices("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL"))
     supabase_publishable_key: str | None = Field(default=None, validation_alias=AliasChoices("SUPABASE_PUBLISHABLE_KEY", "SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"))
+    sentry_dsn: str | None = Field(default=None, validation_alias="SENTRY_DSN")
+    sentry_environment: str | None = Field(default=None, validation_alias="SENTRY_ENVIRONMENT")
+    sentry_traces_sample_rate: float = Field(default=0.0, validation_alias="SENTRY_TRACES_SAMPLE_RATE")
+    ibkr_sync_token: str | None = Field(default=None, validation_alias="FIELDNOTES_IBKR_SYNC_TOKEN")
 
     @property
     def is_production(self) -> bool:
@@ -19,6 +23,10 @@ class Settings(BaseSettings):
     @property
     def authentication_enabled(self) -> bool:
         return bool(self.supabase_url and self.supabase_publishable_key)
+
+    def validate_production(self) -> None:
+        if self.is_production and not self.authentication_enabled:
+            raise RuntimeError("Supabase authentication must be configured in production")
 
     class Config:
         env_file = ".env"

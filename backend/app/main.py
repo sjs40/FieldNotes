@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -9,24 +9,18 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import CallBenchmarkSnapshot, CallEvent, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteTag, Security, SecurityPrice, Tag, TrackedCall, TrackedCallLeg
+from .models import BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteTag, PortfolioPosition, Security, SecurityPrice, Tag, ThesisDetails, TrackedCall, TrackedCallLeg
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
 from .journal import call_return_object, create_note, replace_note_relationships, serialize_call, serialize_note as serialize_journal_note
 from .lifecycle import execute as execute_lifecycle
+from .observability import RequestObservabilityMiddleware, init_sentry, log_event
+from hashlib import sha256
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
-
-
-def run_production_migrations() -> None:
-    """Apply committed Alembic revisions before a production instance serves."""
-    from alembic import command
-    from alembic.config import Config
-
-    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
-    command.upgrade(config, "head")
+app.add_middleware(RequestObservabilityMiddleware)
 
 
 class ParseRequest(BaseModel):
@@ -42,6 +36,7 @@ class PublishRequest(BaseModel):
     body: str
     note_type: str = "note"
     title: str = ""
+    thesis_details: dict | None = None
 
 
 class EditNoteRequest(BaseModel):
@@ -56,6 +51,10 @@ class LifecycleRequest(BaseModel):
     invalidation_category: str | None = None
     body: str | None = None
     title: str = ""
+    confidence_before: str | None = None
+    confidence_after: str | None = None
+    thesis_state: str | None = None
+    allow_snapshot_unavailable: bool = False
 
 
 class RefreshRequest(BaseModel):
@@ -65,9 +64,37 @@ class RefreshRequest(BaseModel):
 class BackfillRequest(BaseModel):
     notes: list[dict]
 
+class ExpectationRequest(BaseModel):
+    target_value: float | None = None
+    target_type: str = "security_price"
+    target_unit: str = "USD"
+    explanation: str = Field(min_length=1)
+
+class IBKRSyncRequest(BaseModel):
+    user_id: str
+    connection_name: str = "Interactive Brokers"
+    account_id: str
+    account_type: str | None = None
+    base_currency: str = "USD"
+    snapshot_at: datetime
+    positions: list[dict]
+
 
 def serialized_note(session: Session, note: Note) -> dict:
-    return serialize_journal_note(session, note)
+    result = serialize_journal_note(session, note)
+    details = session.scalar(select(ThesisDetails).where(ThesisDetails.note_id == note.id))
+    if details:
+        result["thesis_details"] = {"core_thesis": details.core_thesis, "key_evidence": details.key_evidence_json, "catalysts": details.catalysts_json, "risks": details.risks_json, "invalidation_conditions": details.invalidation_conditions_json, "valuation_notes": details.valuation_notes, "expected_time_horizon_days": details.expected_time_horizon_days, "review_at": details.review_at.isoformat() if details.review_at else None}
+    return result
+
+def save_thesis_details(session: Session, note_id: str, payload: dict | None) -> None:
+    if not payload:
+        return
+    allowed = {"core_thesis", "valuation_notes", "expected_time_horizon_days", "review_at"}
+    lists = {"key_evidence": "key_evidence_json", "catalysts": "catalysts_json", "risks": "risks_json", "invalidation_conditions": "invalidation_conditions_json"}
+    values = {key: value for key, value in payload.items() if key in allowed}
+    values.update({column: payload.get(key, []) for key, column in lists.items()})
+    session.add(ThesisDetails(note_id=note_id, **values))
 
 
 def record_frontend_note(session: Session, incoming: dict) -> Note:
@@ -99,17 +126,39 @@ def record_frontend_note(session: Session, incoming: dict) -> Note:
 def bootstrap() -> None:
     # Local convenience only. In production migrations run through Alembic,
     # never through SQLAlchemy metadata creation.
+    init_sentry()
     if not settings.is_production:
         Base.metadata.create_all(engine)
         return
-    if not settings.authentication_enabled:
-        raise RuntimeError("Supabase authentication must be configured in production")
-    run_production_migrations()
+    settings.validate_production()
 
 
 @app.get("/api/health")
 def health():
     return {"status": "ok", "provider": "yfinance"}
+
+@app.get("/api/health/live")
+def health_live(request: Request):
+    return {"status": "live", "request_id": request.state.request_id}
+
+@app.get("/api/health/ready")
+def health_ready(request: Request, session: Session = Depends(get_session)):
+    try:
+        session.execute(select(1))
+        settings.validate_production()
+        from alembic.runtime.migration import MigrationContext
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+        with engine.connect() as connection: current = MigrationContext.configure(connection).get_current_revision()
+        expected = ScriptDirectory.from_config(Config(str(Path(__file__).parents[2] / "alembic.ini"))).get_current_head()
+        usable = current == expected or not settings.is_production
+        response = {"status": "ready" if usable else "not_ready", "database": "ok", "authentication": "configured" if settings.authentication_enabled else "local_development", "migration_revision": current, "expected_revision": expected, "market_data_provider": "yfinance" if settings.allow_yfinance else "disabled", "request_id": request.state.request_id}
+        if not usable: raise HTTPException(status_code=503, detail=response)
+        return response
+    except HTTPException: raise
+    except Exception as exc:
+        log_event("readiness_failure", "ERROR", error_class=type(exc).__name__)
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "database": "unavailable", "request_id": request.state.request_id})
 
 
 @app.get("/api/auth/me")
@@ -154,6 +203,7 @@ async def create_draft(payload: PublishRequest, user: CurrentUser = Depends(get_
     if parsed["errors"]:
         raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
     note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="draft")
+    save_thesis_details(session, note.id, payload.thesis_details)
     session.commit()
     return serialized_note(session, note)
 
@@ -248,6 +298,57 @@ async def call_detail(call_id: str, user: CurrentUser = Depends(get_current_user
         "reversed_from_call_id": call.reversed_from_call_id,
     }
 
+@app.post("/api/calls/{call_id}/expectation")
+def revise_expectation(call_id: str, payload: ExpectationRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    call = session.scalar(select(TrackedCall).where(TrackedCall.id == call_id, TrackedCall.user_id == user.id))
+    if not call: raise HTTPException(404, "Tracked call not found")
+    if payload.target_type == "security_price" and (payload.target_value is None or payload.target_value <= 0): raise HTTPException(422, "Target price must be positive")
+    old = session.scalar(select(CallExpectation).where(CallExpectation.tracked_call_id == call.id).order_by(CallExpectation.created_at.desc()))
+    session.add(CallExpectation(tracked_call_id=call.id, target_type=payload.target_type, target_value=payload.target_value, target_unit=payload.target_unit))
+    session.add(CallEvent(note_id=call.originating_note_id, tracked_call_id=call.id, event_type="expectation_updated", explanation=payload.explanation, snapshot_json={"old_target": float(old.target_value) if old and old.target_value is not None else None, "new_target": payload.target_value}))
+    session.commit()
+    return {"call": serialize_call(session, call)}
+
+def _sync_authorized(request: Request) -> None:
+    token = request.headers.get("X-FieldNotes-Sync-Token", "")
+    if not settings.ibkr_sync_token or not token or token != settings.ibkr_sync_token:
+        raise HTTPException(status_code=401, detail="Invalid sync credential")
+
+@app.post("/api/integrations/ibkr/sync")
+def ibkr_sync(payload: IBKRSyncRequest, request: Request, session: Session = Depends(get_session)):
+    _sync_authorized(request)
+    account_hash = sha256(payload.account_id.encode()).hexdigest()
+    connection = session.scalar(select(BrokerageConnection).where(BrokerageConnection.user_id == payload.user_id, BrokerageConnection.provider == "ibkr"))
+    if not connection:
+        connection = BrokerageConnection(user_id=payload.user_id, provider="ibkr", display_name=payload.connection_name); session.add(connection); session.flush()
+    account = session.scalar(select(BrokerageAccount).where(BrokerageAccount.connection_id == connection.id, BrokerageAccount.external_account_id_hash == account_hash))
+    if not account:
+        account = BrokerageAccount(connection_id=connection.id, external_account_id_hash=account_hash, display_name="IBKR account •" + payload.account_id[-4:], account_type=payload.account_type, base_currency=payload.base_currency); session.add(account); session.flush()
+    existing = session.scalar(select(PortfolioPosition).where(PortfolioPosition.brokerage_account_id == account.id, PortfolioPosition.snapshot_at == payload.snapshot_at))
+    if existing: return {"status": "ok", "idempotent_replay": True}
+    for row in payload.positions:
+        symbol = str(row["symbol"]).upper(); security = session.scalar(select(Security).where(Security.symbol == symbol)) or Security(symbol=symbol, currency=row.get("currency", payload.base_currency)); session.add(security); session.flush()
+        session.add(PortfolioPosition(brokerage_account_id=account.id, security_id=security.id, external_contract_id=row.get("contract_id"), quantity=row["quantity"], average_cost=row.get("average_cost"), market_price=row.get("market_price"), market_value=row.get("market_value"), unrealized_pnl=row.get("unrealized_pnl"), realized_pnl=row.get("realized_pnl"), currency=row.get("currency", payload.base_currency), snapshot_at=payload.snapshot_at, metadata_json={"source": "ibkr_sync_agent"}))
+    connection.last_synced_at = account.last_synced_at = payload.snapshot_at; session.commit(); log_event("ibkr_sync", user_id=payload.user_id, position_count=len(payload.positions))
+    return {"status": "ok", "idempotent_replay": False}
+
+@app.get("/api/portfolio/accounts")
+def portfolio_accounts(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    return [{"id": a.id, "display_name": a.display_name, "base_currency": a.base_currency, "last_synced_at": a.last_synced_at} for a in session.scalars(select(BrokerageAccount).join(BrokerageConnection).where(BrokerageConnection.user_id == user.id)).all()]
+
+@app.get("/api/portfolio/positions")
+@app.get("/api/portfolio")
+def portfolio(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    rows = session.execute(select(PortfolioPosition, Security).join(Security).join(BrokerageAccount).join(BrokerageConnection).where(BrokerageConnection.user_id == user.id).order_by(PortfolioPosition.snapshot_at.desc())).all()
+    latest = {}
+    for position, security in rows: latest.setdefault((position.brokerage_account_id, security.id), {"security_id": security.id, "symbol": security.symbol, "quantity": float(position.quantity), "average_cost": float(position.average_cost) if position.average_cost is not None else None, "market_price": float(position.market_price) if position.market_price is not None else None, "market_value": float(position.market_value) if position.market_value is not None else None, "unrealized_pnl": float(position.unrealized_pnl) if position.unrealized_pnl is not None else None, "snapshot_at": position.snapshot_at})
+    return list(latest.values())
+
+@app.get("/api/portfolio/positions/{security_id}")
+def portfolio_security(security_id: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    positions = portfolio(user, session)
+    return [row for row in positions if row["security_id"] == security_id]
+
 
 @app.get("/api/tickers")
 async def list_tickers(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
@@ -318,7 +419,9 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
     if parsed["tracked_calls"] and quote_failures:
         raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
     note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published", quotes=quotes)
+    save_thesis_details(session, note.id, payload.thesis_details)
     session.commit()
+    log_event("note_published", user_id=user.id, note_id=note.id, call_count=len(parsed["tracked_calls"]))
     return serialized_note(session, note)
 
 
@@ -405,7 +508,7 @@ def lifecycle(call_id: str, event_type: str, payload: LifecycleRequest, user: Cu
     return execute_lifecycle(session, call_id=call_id, user_id=user.id, event_type=event_type,
         explanation=payload.explanation, idempotency_key=payload.idempotency_key,
         invalidation_category=payload.invalidation_category, body=payload.body, title=payload.title,
-        provider=YFinanceMarketDataProvider())
+        provider=YFinanceMarketDataProvider(), confidence_before=payload.confidence_before, confidence_after=payload.confidence_after, thesis_state=payload.thesis_state, allow_snapshot_unavailable=payload.allow_snapshot_unavailable)
 
 
 @app.get("/api/export/calls.csv")
@@ -427,6 +530,7 @@ web_root = Path(__file__).parents[2]
 @app.get("/calls/{call_id}")
 @app.get("/tickers/{symbol}")
 @app.get("/settings")
+@app.get("/portfolio")
 @app.get("/login")
 def journal_route():
     """Serve the client shell for bookmarkable Phase 2 journal routes."""
