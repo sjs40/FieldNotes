@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -469,4 +470,16 @@ def export_calls(user: CurrentUser = Depends(get_current_user), session: Session
 
 
 web_root = Path(__file__).parents[2]
+
+
+@app.get("/notes/{note_id}")
+@app.get("/calls/{call_id}")
+@app.get("/tickers/{symbol}")
+@app.get("/settings")
+@app.get("/login")
+def journal_route():
+    """Serve the client shell for bookmarkable Phase 2 journal routes."""
+    return FileResponse(web_root / "index.html")
+
+
 app.mount("/", StaticFiles(directory=web_root, html=True), name="web")
