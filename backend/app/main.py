@@ -188,9 +188,10 @@ async def list_tickers(user: CurrentUser = Depends(get_current_user), session: S
     return [{"symbol": symbol, "notes": notes, "open_calls": open_call_counts.get(symbol, 0), "first_mentioned_at": first.isoformat() if first else None} for symbol, notes, first in rows]
 
 
-@app.post("/api/notes/sync")
-def sync_notes(payload: SyncRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
-    """Legacy-only import bridge; new browser writes use individual note APIs."""
+@app.post("/api/notes/import-legacy")
+@app.post("/api/notes/sync", deprecated=True)
+def import_legacy_notes(payload: SyncRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Explicit compatibility import; new browser writes use individual APIs."""
     for incoming in payload.notes:
         note = record_frontend_note(session, incoming)
         note.user_id = user.id

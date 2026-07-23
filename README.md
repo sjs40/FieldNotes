@@ -54,6 +54,10 @@ PostgreSQL (for example Supabase) and Supabase Auth.
 - `POST /api/market-data/refresh` — refresh open-call prices for the current
   user.
 
+The legacy prototype importer remains available at
+`POST /api/notes/import-legacy` (and as `backend/scripts/migrate_legacy_calls.py`)
+for an intentional, reviewed migration. It is not used by the current UI.
+
 ## Production database and migrations
 
 Set `ENVIRONMENT=production`, a managed PostgreSQL `DATABASE_URL` (for example
