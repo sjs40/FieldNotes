@@ -14,6 +14,7 @@ from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
 from .journal import call_return_object, create_note, replace_note_relationships, serialize_call, serialize_note as serialize_journal_note
+from .lifecycle import execute as execute_lifecycle
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
@@ -128,7 +129,7 @@ def parse(payload: ParseRequest):
 
 
 @app.get("/api/notes")
-async def list_notes(note_type: str | None = None, status: str | None = None, ticker: str | None = None, tag: str | None = None, has_call: bool | None = None, limit: int = 100, offset: int = 0, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+async def list_notes(note_type: str | None = None, status: str | None = None, ticker: str | None = None, tag: str | None = None, has_call: bool | None = None, call_type: str | None = None, call_status: str | None = None, edited: bool | None = None, has_updates: bool | None = None, date_from: datetime | None = None, date_to: datetime | None = None, sort: str = "newest", limit: int = 100, offset: int = 0, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     statement = select(Note).where(Note.user_id == user.id)
     if note_type: statement = statement.where(Note.type == note_type)
     if status: statement = statement.where(Note.status == status)
@@ -136,7 +137,14 @@ async def list_notes(note_type: str | None = None, status: str | None = None, ti
     if tag: statement = statement.join(NoteTag, NoteTag.note_id == Note.id).join(Tag, Tag.id == NoteTag.tag_id).where(Tag.normalized_name == tag.lower())
     if has_call is True: statement = statement.where(select(TrackedCall.id).where(TrackedCall.originating_note_id == Note.id).exists())
     if has_call is False: statement = statement.where(~select(TrackedCall.id).where(TrackedCall.originating_note_id == Note.id).exists())
-    notes = session.scalars(statement.distinct().order_by(Note.created_at.desc()).offset(max(0, offset)).limit(min(max(1, limit), 200))).all()
+    if call_type: statement = statement.where(select(TrackedCall.id).where(TrackedCall.originating_note_id == Note.id, TrackedCall.call_type == call_type).exists())
+    if call_status: statement = statement.where(select(TrackedCall.id).where(TrackedCall.originating_note_id == Note.id, TrackedCall.status == call_status).exists())
+    if edited is True: statement = statement.where(select(func.count(NoteRevision.id)).where(NoteRevision.note_id == Note.id).scalar_subquery() > 1)
+    if has_updates is True: statement = statement.where(select(NoteRelationship.id).where(NoteRelationship.to_note_id == Note.id, NoteRelationship.relationship_type == "update_of").exists())
+    if date_from: statement = statement.where(Note.created_at >= date_from)
+    if date_to: statement = statement.where(Note.created_at <= date_to)
+    order = Note.created_at.asc() if sort == "oldest" else Note.updated_at.desc() if sort == "recently_edited" else Note.created_at.desc()
+    notes = session.scalars(statement.distinct().order_by(order).offset(max(0, offset)).limit(min(max(1, limit), 200))).all()
     return [serialized_note(session, note) for note in notes]
 
 
@@ -151,16 +159,16 @@ async def create_draft(payload: PublishRequest, user: CurrentUser = Depends(get_
 
 
 @app.get("/api/notes/search")
-async def search_notes(q: str = "", user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+async def search_notes(q: str = "", limit: int = 100, offset: int = 0, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     query = q.strip()
     if not query:
         return []
     pattern = f"%{query}%"
     notes = session.scalars(
-        select(Note).where(
+        select(Note).outerjoin(NoteTag, NoteTag.note_id == Note.id).outerjoin(Tag, Tag.id == NoteTag.tag_id).outerjoin(NoteSecurityMention, NoteSecurityMention.note_id == Note.id).outerjoin(Security, Security.id == NoteSecurityMention.security_id).outerjoin(CallEvent, CallEvent.note_id == Note.id).where(
             Note.user_id == user.id,
-            or_(Note.title.ilike(pattern), Note.body.ilike(pattern)),
-        ).order_by(Note.created_at.desc())
+            or_(Note.title.ilike(pattern), Note.body.ilike(pattern), Tag.display_name.ilike(pattern), Security.symbol.ilike(pattern), Security.company_name.ilike(pattern), CallEvent.explanation.ilike(pattern)),
+        ).distinct().order_by(Note.created_at.desc()).offset(max(0, offset)).limit(min(max(1, limit), 200))
     ).all()
     return [serialized_note(session, note) for note in notes]
 
@@ -193,11 +201,17 @@ async def edit_note(note_id: str, payload: EditNoteRequest, user: CurrentUser = 
 
 
 @app.get("/api/calls")
-async def list_calls(status: str | None = None, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+async def list_calls(status: str | None = None, call_type: str | None = None, ticker: str | None = None, tag: str | None = None, date_from: datetime | None = None, date_to: datetime | None = None, sort: str = "newest", limit: int = 100, offset: int = 0, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     statement = select(TrackedCall).where(TrackedCall.user_id == user.id)
     if status:
         statement = statement.where(TrackedCall.status == status)
-    calls = session.scalars(statement.order_by(TrackedCall.opened_at.desc())).all()
+    if call_type: statement = statement.where(TrackedCall.call_type == call_type)
+    if ticker: statement = statement.join(TrackedCallLeg, TrackedCallLeg.tracked_call_id == TrackedCall.id).join(Security, Security.id == TrackedCallLeg.security_id).where(Security.symbol == ticker.upper())
+    if tag: statement = statement.join(Note, Note.id == TrackedCall.originating_note_id).join(NoteTag, NoteTag.note_id == Note.id).join(Tag, Tag.id == NoteTag.tag_id).where(Tag.normalized_name == tag.lower())
+    if date_from: statement = statement.where(TrackedCall.opened_at >= date_from)
+    if date_to: statement = statement.where(TrackedCall.opened_at <= date_to)
+    order = TrackedCall.opened_at.asc() if sort == "oldest" else TrackedCall.closed_at.desc() if sort == "closed" else TrackedCall.opened_at.desc()
+    calls = session.scalars(statement.distinct().order_by(order).offset(max(0, offset)).limit(min(max(1, limit), 200))).all()
     result = []
     for call in calls:
         note = session.get(Note, call.originating_note_id)
@@ -388,73 +402,10 @@ def backfill_legacy_entries(payload: BackfillRequest, user: CurrentUser = Depend
 
 @app.post("/api/calls/{call_id}/{event_type}")
 def lifecycle(call_id: str, event_type: str, payload: LifecycleRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
-    if event_type not in {"updated", "closed", "reversed", "invalidated"}:
-        raise HTTPException(status_code=422, detail="Unsupported lifecycle event")
-    call = session.scalar(select(TrackedCall).where(TrackedCall.id == call_id, TrackedCall.user_id == user.id))
-    if not call:
-        raise HTTPException(status_code=404, detail="Tracked call not found")
-    existing = session.scalar(select(CallEvent).where(CallEvent.tracked_call_id == call.id, CallEvent.idempotency_key == payload.idempotency_key))
-    if existing:
-        return {"call": serialize_call(session, call), "idempotent_replay": True}
-    if call.status != "open":
-        raise HTTPException(status_code=409, detail="Lifecycle actions are allowed only on open calls")
-    if event_type == "invalidated" and payload.invalidation_category not in {"core_assumption_disproven", "catalyst_failed", "new_information", "reasoning_flawed", "other"}:
-        raise HTTPException(status_code=422, detail="A valid invalidation category is required")
-
-    legs = session.scalars(select(TrackedCallLeg).where(TrackedCallLeg.tracked_call_id == call.id).order_by(TrackedCallLeg.leg_order)).all()
-    benchmark = session.scalar(select(CallBenchmarkSnapshot).where(CallBenchmarkSnapshot.tracked_call_id == call.id))
-    security_by_id = {security.id: security for security in session.scalars(select(Security).where(Security.id.in_([leg.security_id for leg in legs] + [benchmark.benchmark_security_id]))).all()}
-    provider = YFinanceMarketDataProvider()
-    quotes, failures = {}, {}
-    for security in security_by_id.values():
-        try:
-            quotes[security.id] = provider.get_latest_quote(security.symbol)
-        except Exception as exc:
-            failures[security.symbol] = str(exc)
-    if failures:
-        raise HTTPException(status_code=503, detail={"message": "No lifecycle change was made because required exit quotes could not be captured.", "failures": failures})
-
-    reversed_call = None
-    if event_type == "updated":
-        if not payload.body:
-            raise HTTPException(status_code=422, detail="Update text is required")
-        parsed = parse_note(payload.body, "note")
-        if parsed["errors"]:
-            raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
-        if parsed["tracked_calls"]:
-            raise HTTPException(status_code=422, detail="Updates cannot open a new tracked call. Publish a separate note to create one.")
-        update_note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published")
-        session.add(NoteRelationship(from_note_id=update_note.id, to_note_id=call.originating_note_id, relationship_type="update_of"))
-        event_note_id = update_note.id
-    else:
-        for leg in legs:
-            quote = quotes[leg.security_id]
-            leg.exit_price_raw = quote.price; leg.exit_price_adjusted = quote.price; leg.exit_quote_at = quote.timestamp; leg.exit_price_type = quote.price_type; leg.exit_provider = quote.provider
-        quote = quotes[benchmark.benchmark_security_id]
-        benchmark.exit_price_raw = quote.price; benchmark.exit_price_adjusted = quote.price; benchmark.exit_quote_at = quote.timestamp; benchmark.exit_price_type = quote.price_type; benchmark.exit_provider = quote.provider
-        call.status = "invalidated" if event_type == "invalidated" else "closed"
-        call.closed_at = datetime.now(timezone.utc)
-        call.closing_reason = payload.explanation
-        call.invalidation_category = payload.invalidation_category if event_type == "invalidated" else None
-        event_note_id = call.originating_note_id
-        if event_type == "reversed":
-            new_type = {"bull": "bear", "bear": "bull"}.get(call.call_type, "long_short")
-            reversed_call = TrackedCall(user_id=user.id, originating_note_id=call.originating_note_id, call_type=new_type, status="open", benchmark_security_id=benchmark.benchmark_security_id, opened_at=call.closed_at, reversed_from_call_id=call.id, legacy_metadata_json={"source": "lifecycle_reverse"})
-            session.add(reversed_call); session.flush()
-            reversed_legs = list(reversed(legs)) if call.call_type == "long_short" else legs
-            for order, old_leg in enumerate(reversed_legs, start=1):
-                new_direction = "long" if (call.call_type == "long_short" and order == 1) else "short" if call.call_type == "long_short" else ("short" if old_leg.direction == "long" else "long")
-                quote = quotes[old_leg.security_id]
-                session.add(TrackedCallLeg(tracked_call_id=reversed_call.id, security_id=old_leg.security_id, direction=new_direction, leg_order=order, entry_price_raw=quote.price, entry_price_adjusted=quote.price, entry_quote_at=quote.timestamp, entry_price_type=quote.price_type, entry_provider=quote.provider))
-            benchmark_quote = quotes[benchmark.benchmark_security_id]
-            session.add(CallBenchmarkSnapshot(tracked_call_id=reversed_call.id, benchmark_security_id=benchmark.benchmark_security_id, entry_price_raw=benchmark_quote.price, entry_price_adjusted=benchmark_quote.price, entry_quote_at=benchmark_quote.timestamp, entry_price_type=benchmark_quote.price_type, entry_provider=benchmark_quote.provider))
-            session.add(CallEvent(note_id=call.originating_note_id, tracked_call_id=reversed_call.id, event_type="opened", explanation="Opened by reversal", snapshot_json={"reversed_from_call_id": call.id}))
-    session.add(CallEvent(note_id=event_note_id, tracked_call_id=call.id, event_type=event_type, explanation=payload.explanation, idempotency_key=payload.idempotency_key, snapshot_json={"tracked_call_id": call.id, "status": call.status, "quote_symbols": [security.symbol for security in security_by_id.values()]}))
-    session.commit()
-    result = {"call": serialize_call(session, call)}
-    if reversed_call:
-        result["reversed_call"] = serialize_call(session, reversed_call)
-    return result
+    return execute_lifecycle(session, call_id=call_id, user_id=user.id, event_type=event_type,
+        explanation=payload.explanation, idempotency_key=payload.idempotency_key,
+        invalidation_category=payload.invalidation_category, body=payload.body, title=payload.title,
+        provider=YFinanceMarketDataProvider())
 
 
 @app.get("/api/export/calls.csv")
