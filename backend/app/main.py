@@ -12,7 +12,7 @@ from .models import CallBenchmarkSnapshot, CallEvent, Note, NoteRelationship, No
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
-from .journal import call_return_object, create_note, serialize_call, serialize_note as serialize_journal_note
+from .journal import call_return_object, create_note, replace_note_relationships, serialize_call, serialize_note as serialize_journal_note
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
@@ -37,6 +37,12 @@ class SyncRequest(BaseModel):
 
 
 class PublishRequest(BaseModel):
+    body: str
+    note_type: str = "note"
+    title: str = ""
+
+
+class EditNoteRequest(BaseModel):
     body: str
     note_type: str = "note"
     title: str = ""
@@ -157,6 +163,24 @@ async def list_revisions(note_id: str, user: CurrentUser = Depends(get_current_u
         raise HTTPException(status_code=404, detail="Note not found")
     revisions = session.scalars(select(NoteRevision).where(NoteRevision.note_id == note.id).order_by(NoteRevision.revision_number.desc())).all()
     return [{"id": revision.id, "revision_number": revision.revision_number, "title": revision.title or "", "body": revision.body, "type": revision.type, "edited_at": revision.edited_at.isoformat()} for revision in revisions]
+
+
+@app.put("/api/notes/{note_id}")
+async def edit_note(note_id: str, payload: EditNoteRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    note = session.scalar(select(Note).where(Note.id == note_id, Note.user_id == user.id))
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    parsed = parse_note(payload.body, payload.note_type)
+    if parsed["errors"]:
+        raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
+    if parsed["tracked_calls"]:
+        raise HTTPException(status_code=422, detail="Editing a note cannot open, close, or remove historical calls. Publish a separate note for new tracking syntax.")
+    revision_number = (session.scalar(select(func.max(NoteRevision.revision_number)).where(NoteRevision.note_id == note.id)) or 0) + 1
+    note.title = payload.title or None; note.body = parsed["clean_body"]; note.type = parsed["note_type"]
+    replace_note_relationships(session, note, parsed)
+    session.add(NoteRevision(note_id=note.id, user_id=user.id, revision_number=revision_number, title=note.title, body=note.body, type=note.type))
+    session.commit()
+    return serialized_note(session, note)
 
 
 @app.get("/api/calls")

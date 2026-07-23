@@ -192,3 +192,18 @@ def create_note(
         ))
         session.add(CallEvent(note_id=note.id, event_type="opened", occurred_at=now, snapshot_json={"tracked_call_id": call.id, "source": "api"}))
     return note
+
+
+def replace_note_relationships(session: Session, note: Note, parsed: dict) -> None:
+    """Rebuild mutable tag/ticker mentions; calls intentionally remain untouched."""
+    session.query(NoteTag).filter(NoteTag.note_id == note.id).delete()
+    session.query(NoteSecurityMention).filter(NoteSecurityMention.note_id == note.id).delete()
+    for tag_name in parsed["tags"]:
+        tag = session.scalar(select(Tag).where(Tag.normalized_name == tag_name.lower()))
+        if not tag:
+            tag = Tag(normalized_name=tag_name.lower(), display_name=tag_name)
+            session.add(tag); session.flush()
+        session.add(NoteTag(note_id=note.id, tag_id=tag.id))
+    for symbol in parsed["ticker_mentions"]:
+        security = _security(session, symbol)
+        session.add(NoteSecurityMention(note_id=note.id, security_id=security.id, raw_token=f"${symbol}"))

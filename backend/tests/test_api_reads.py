@@ -55,6 +55,14 @@ class NormalizedReadApiTests(unittest.TestCase):
         self.assertEqual(revisions.status_code, 200)
         self.assertEqual(revisions.json()[0]["revision_number"], 1)
 
+    def test_edit_creates_revision_without_changing_call(self):
+        response = self.client.put(f"/api/notes/{self.note.id}", json={"title": "Apple revised", "body": "Updated distribution view. $AAPL #AI", "note_type": "thesis"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["title"], "Apple revised")
+        self.assertEqual(response.json()["calls"][0]["symbol"], "AAPL")
+        revisions = self.client.get(f"/api/notes/{self.note.id}/revisions").json()
+        self.assertEqual([item["revision_number"] for item in revisions], [2, 1])
+
 
 if __name__ == "__main__":
     unittest.main()
