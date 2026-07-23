@@ -44,8 +44,9 @@ Run schema migrations explicitly during deployment:
 alembic upgrade head
 ```
 
-The Vercel entry point is `api/index.py`; `vercel.json` routes API requests to
-that FastAPI application. Do not commit `.env`, database files, or credentials.
+The Vercel entry point is `api/index.py`; `vercel.json` rewrites all requests
+to that FastAPI application, which serves both the UI and `/api/*` routes. Do
+not commit `.env`, database files, or credentials.
 
 ## Checks
 

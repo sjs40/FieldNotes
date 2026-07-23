@@ -1,5 +1,11 @@
 {
-  "version": 2,
-  "builds": [{"src": "api/index.py", "use": "@vercel/python"}],
-  "routes": [{"src": "/api/(.*)", "dest": "/api/index.py"}]
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/index.py": {
+      "includeFiles": "{backend/**,index.html,app-modern.js,api-bridge.js,refresh-prices.js,styles.css,overrides.css}"
+    }
+  },
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index.py" }
+  ]
 }
