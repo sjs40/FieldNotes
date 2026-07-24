@@ -1,0 +1,30 @@
+/* Mobile PWA navigation and touch-target refinements. */
+.mobile-nav { display: none; }
+
+@media (max-width: 850px) {
+  .shell { grid-template-columns: 1fr; padding-bottom: 72px; }
+  .mobile-nav {
+    position: fixed; z-index: 20; bottom: 0; left: 0; right: 0;
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 2px;
+    padding: 7px 8px max(7px, env(safe-area-inset-bottom));
+    background: #f2f1edee; border-top: 1px solid var(--line); backdrop-filter: blur(14px);
+  }
+  .mobile-nav button {
+    min-height: 49px; border: 0; border-radius: 8px; background: transparent;
+    color: #65665f; display: grid; place-items: center; gap: 2px; font: 10px 'DM Mono';
+  }
+  .mobile-nav .icon { font: 13px 'DM Sans'; line-height: 1; font-weight: 600; }
+  .mobile-nav button.active { color: #273b31; background: #e2e7e2; }
+  .mobile-nav .capture-tab { color: #fff; background: #273b31; font-weight: 600; }
+  .mobile-nav .capture-tab .icon { font-size: 22px; font-weight: 400; }
+  .mobile-nav .capture-tab.active { color: #fff; background: #326451; }
+  .quick input { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin: 0 0 10px; background: #fffefa; }
+  .quick-foot { gap: 8px; }
+  .quick-foot .btn { min-height: 40px; }
+  .topbar { gap: 12px; }
+  .topbar h1 { font-size: 28px; }
+  .today { display: none; }
+  .detail-card { padding: 19px; }
+  .modal { padding: 18px; }
+  .table-wrap { margin-right: -18px; border-right: 0; border-radius: 9px 0 0 9px; }
+}
