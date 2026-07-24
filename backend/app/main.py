@@ -229,7 +229,16 @@ async def list_notes(note_type: str | None = None, status: str | None = None, ti
     if date_from: statement = statement.where(Note.created_at >= date_from)
     if date_to: statement = statement.where(Note.created_at <= date_to)
     order = Note.created_at.asc() if sort == "oldest" else Note.updated_at.desc() if sort == "recently_edited" else Note.created_at.desc()
-    notes = session.scalars(statement.distinct().order_by(order).offset(max(0, offset)).limit(min(max(1, limit), 200))).all()
+    # PostgreSQL cannot apply DISTINCT to the JSON metadata column on Note.
+    # De-duplicate lightweight IDs instead, then hydrate the requested notes.
+    note_ids = session.execute(
+        statement.with_only_columns(Note.id, order)
+        .distinct()
+        .order_by(order)
+        .offset(max(0, offset))
+        .limit(min(max(1, limit), 200))
+    ).all()
+    notes = [session.get(Note, note_id) for note_id, _ in note_ids]
     return [serialized_note(session, note) for note in notes]
 
 
@@ -250,12 +259,13 @@ async def search_notes(q: str = "", limit: int = 100, offset: int = 0, user: Cur
     if not query:
         return []
     pattern = f"%{query}%"
-    notes = session.scalars(
-        select(Note).outerjoin(NoteTag, NoteTag.note_id == Note.id).outerjoin(Tag, Tag.id == NoteTag.tag_id).outerjoin(NoteSecurityMention, NoteSecurityMention.note_id == Note.id).outerjoin(Security, Security.id == NoteSecurityMention.security_id).outerjoin(CallEvent, CallEvent.note_id == Note.id).where(
+    note_ids = session.execute(
+        select(Note.id, Note.created_at).outerjoin(NoteTag, NoteTag.note_id == Note.id).outerjoin(Tag, Tag.id == NoteTag.tag_id).outerjoin(NoteSecurityMention, NoteSecurityMention.note_id == Note.id).outerjoin(Security, Security.id == NoteSecurityMention.security_id).outerjoin(CallEvent, CallEvent.note_id == Note.id).where(
             Note.user_id == user.id,
             or_(Note.title.ilike(pattern), Note.body.ilike(pattern), Tag.display_name.ilike(pattern), Security.symbol.ilike(pattern), Security.company_name.ilike(pattern), CallEvent.explanation.ilike(pattern)),
         ).distinct().order_by(Note.created_at.desc()).offset(max(0, offset)).limit(min(max(1, limit), 200))
     ).all()
+    notes = [session.get(Note, note_id) for note_id, _ in note_ids]
     return [serialized_note(session, note) for note in notes]
 
 
@@ -297,7 +307,14 @@ async def list_calls(status: str | None = None, call_type: str | None = None, ti
     if date_from: statement = statement.where(TrackedCall.opened_at >= date_from)
     if date_to: statement = statement.where(TrackedCall.opened_at <= date_to)
     order = TrackedCall.opened_at.asc() if sort == "oldest" else TrackedCall.closed_at.desc() if sort == "closed" else TrackedCall.opened_at.desc()
-    calls = session.scalars(statement.distinct().order_by(order).offset(max(0, offset)).limit(min(max(1, limit), 200))).all()
+    call_ids = session.execute(
+        statement.with_only_columns(TrackedCall.id, order)
+        .distinct()
+        .order_by(order)
+        .offset(max(0, offset))
+        .limit(min(max(1, limit), 200))
+    ).all()
+    calls = [session.get(TrackedCall, call_id) for call_id, _ in call_ids]
     result = []
     for call in calls:
         note = session.get(Note, call.originating_note_id)
