@@ -256,3 +256,37 @@ class PortfolioPosition(Base):
     currency: Mapped[str] = mapped_column(String(8), default="USD")
     snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class UserReviewSettings(Base):
+    __tablename__ = "user_review_settings"
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    stale_warning_days: Mapped[int] = mapped_column(Integer, default=45)
+    stale_critical_days: Mapped[int] = mapped_column(Integer, default=90)
+    absolute_move_threshold: Mapped[float] = mapped_column(Numeric(8, 6), default=0.10)
+    relative_move_threshold: Mapped[float] = mapped_column(Numeric(8, 6), default=0.08)
+    daily_move_threshold: Mapped[float] = mapped_column(Numeric(8, 6), default=0.08)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ThesisReview(Base):
+    __tablename__ = "thesis_reviews"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    tracked_call_id: Mapped[str] = mapped_column(ForeignKey("tracked_calls.id"), index=True)
+    review_type: Mapped[str] = mapped_column(String(32), index=True)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    confidence_before: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    confidence_after: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    thesis_state_before: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    thesis_state_after: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    target_changed: Mapped[bool] = mapped_column(Boolean, default=False)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (Index("ix_review_pending_reason", "user_id", "tracked_call_id", "review_type", "review_status"),)

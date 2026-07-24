@@ -207,7 +207,7 @@ def create_note(
         ))
         if request.get("target") is not None:
             session.add(CallExpectation(tracked_call_id=call.id, target_type=request.get("target_type", "security_price"), target_value=request["target"], target_unit=request.get("target_unit", "USD")))
-        session.add(CallEvent(note_id=note.id, event_type="opened", occurred_at=now, snapshot_json={"tracked_call_id": call.id, "source": "api"}))
+        session.add(CallEvent(note_id=note.id, tracked_call_id=call.id, event_type="opened", occurred_at=now, snapshot_json={"tracked_call_id": call.id, "source": "api"}))
     return note
 
 

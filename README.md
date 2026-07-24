@@ -90,6 +90,17 @@ node --check app-modern.js
 node --check refresh-prices.js
 ```
 
+## Thesis review queue
+
+`/review` is a deterministic work queue, not an automated investment adviser.
+Open calls are stale after 45 days without an opening, price-aware update, or
+completed review (critical at 90 days by default). `POST /api/reviews/generate`
+creates idempotent stale, scheduled-review, target, catalyst, horizon, and
+large-move candidates. Reviews can be completed, snoozed, or dismissed without
+changing a tracked call; a lifecycle action remains explicit. Portfolio holdings
+and FieldNotes calls are deliberately independent facts—neither one implies the
+other.
+
 ## IBKR portfolio foundation
 
 Portfolio ingestion is read-only. Vercel cannot connect to TWS running on your

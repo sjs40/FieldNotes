@@ -9,7 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteTag, PortfolioPosition, Security, SecurityPrice, Tag, ThesisDetails, TrackedCall, TrackedCallLeg
+from .models import BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteTag, PortfolioPosition, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, TrackedCall, TrackedCallLeg, UserReviewSettings
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -17,6 +17,8 @@ from .journal import call_return_object, create_note, replace_note_relationships
 from .lifecycle import execute as execute_lifecycle
 from .observability import RequestObservabilityMiddleware, init_sentry, log_event
 from hashlib import sha256
+from .reviews import OUTCOMES, REVIEW_TYPES, STATUSES, generate as generate_reviews, serialize_review, settings_for
+from .timeline import thinking_evolution, ticker_timeline
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
@@ -78,6 +80,26 @@ class IBKRSyncRequest(BaseModel):
     base_currency: str = "USD"
     snapshot_at: datetime
     positions: list[dict]
+
+class ReviewCompleteRequest(BaseModel):
+    outcome: str
+    explanation: str | None = None
+    confidence_before: str | None = None
+    confidence_after: str | None = None
+    thesis_state_before: str | None = None
+    thesis_state_after: str | None = None
+    next_review_at: datetime | None = None
+
+class ReviewSnoozeRequest(BaseModel):
+    snooze_until: datetime
+    explanation: str | None = None
+
+class ReviewSettingsRequest(BaseModel):
+    stale_warning_days: int = Field(default=45, ge=1)
+    stale_critical_days: int = Field(default=90, ge=1)
+    absolute_move_threshold: float = Field(default=.10, gt=0)
+    relative_move_threshold: float = Field(default=.08, gt=0)
+    daily_move_threshold: float = Field(default=.08, gt=0)
 
 
 def serialized_note(session: Session, note: Note) -> dict:
@@ -349,6 +371,20 @@ def portfolio_security(security_id: str, user: CurrentUser = Depends(get_current
     positions = portfolio(user, session)
     return [row for row in positions if row["security_id"] == security_id]
 
+@app.get("/api/portfolio/coverage")
+def portfolio_coverage(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Research coverage is descriptive only; holdings never imply a call stance."""
+    rows=portfolio(user,session); now=datetime.now(timezone.utc); result=[]
+    for row in rows:
+        notes=session.scalars(select(Note).join(NoteSecurityMention).where(Note.user_id==user.id,NoteSecurityMention.security_id==row["security_id"]).order_by(Note.created_at.desc())).all()
+        calls=session.scalars(select(TrackedCall).join(TrackedCallLeg).where(TrackedCall.user_id==user.id,TrackedCallLeg.security_id==row["security_id"],TrackedCall.status=="open")).all()
+        latest=notes[0].created_at if notes else None; latest=latest if latest and latest.tzinfo else latest.replace(tzinfo=timezone.utc) if latest else None
+        days=(now-latest).days if latest else None
+        theses=[note for note in notes if note.type=="thesis"]
+        coverage="no_notes" if not notes else "no_thesis" if not theses else "stale" if days is not None and days>90 else "aging" if days is not None and days>45 else "current"
+        result.append({**row,"latest_note_at":latest.isoformat() if latest else None,"days_since_research":days,"open_calls":len(calls),"coverage":coverage,"portfolio_review_needed":coverage in {"no_notes","no_thesis","stale"}})
+    return result
+
 
 @app.get("/api/tickers")
 async def list_tickers(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
@@ -510,6 +546,73 @@ def lifecycle(call_id: str, event_type: str, payload: LifecycleRequest, user: Cu
         invalidation_category=payload.invalidation_category, body=payload.body, title=payload.title,
         provider=YFinanceMarketDataProvider(), confidence_before=payload.confidence_before, confidence_after=payload.confidence_after, thesis_state=payload.thesis_state, allow_snapshot_unavailable=payload.allow_snapshot_unavailable)
 
+@app.get("/api/review-settings")
+def review_settings(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    row=settings_for(session,user.id); session.commit()
+    return {"stale_warning_days":row.stale_warning_days,"stale_critical_days":row.stale_critical_days,"absolute_move_threshold":float(row.absolute_move_threshold),"relative_move_threshold":float(row.relative_move_threshold),"daily_move_threshold":float(row.daily_move_threshold)}
+
+@app.put("/api/review-settings")
+def update_review_settings(payload: ReviewSettingsRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    if payload.stale_critical_days < payload.stale_warning_days: raise HTTPException(422,"Critical stale threshold must be at least warning threshold")
+    row=settings_for(session,user.id)
+    for field,value in payload.model_dump().items(): setattr(row,field,value)
+    session.commit(); return review_settings(user,session)
+
+@app.post("/api/reviews/generate")
+def generate_review_queue(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    created=generate_reviews(session,user.id); session.commit(); return {"created":len(created),"reviews":[serialize_review(session,r) for r in created]}
+
+@app.get("/api/reviews")
+def list_reviews(status: str | None=None, review_type: str | None=None, ticker: str | None=None, call_id: str | None=None, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    statement=select(ThesisReview).where(ThesisReview.user_id==user.id)
+    if status: statement=statement.where(ThesisReview.review_status==status)
+    if review_type: statement=statement.where(ThesisReview.review_type==review_type)
+    if call_id: statement=statement.where(ThesisReview.tracked_call_id==call_id)
+    reviews=session.scalars(statement.order_by(ThesisReview.created_at.desc())).all()
+    result=[serialize_review(session,r) for r in reviews]
+    if ticker: result=[r for r in result if (r["call"] or {}).get("symbol", "").upper()==ticker.upper() or ticker.upper() in str(r["call"])]
+    return result
+
+@app.get("/api/reviews/{review_id}")
+def review_detail(review_id: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    review=session.scalar(select(ThesisReview).where(ThesisReview.id==review_id,ThesisReview.user_id==user.id))
+    if not review: raise HTTPException(404,"Review not found")
+    return serialize_review(session,review)
+
+@app.post("/api/reviews/{review_id}/complete")
+def complete_review(review_id: str,payload: ReviewCompleteRequest,user: CurrentUser=Depends(get_current_user),session: Session=Depends(get_session)):
+    if payload.outcome not in OUTCOMES: raise HTTPException(422,"Invalid review outcome")
+    review=session.scalar(select(ThesisReview).where(ThesisReview.id==review_id,ThesisReview.user_id==user.id))
+    if not review: raise HTTPException(404,"Review not found")
+    if review.review_status not in {"pending","snoozed"}: raise HTTPException(409,"Review is no longer actionable")
+    call=session.get(TrackedCall,review.tracked_call_id)
+    review.review_status="completed"; review.completed_at=datetime.now(timezone.utc); review.outcome=payload.outcome; review.explanation=payload.explanation
+    for field in ("confidence_before","confidence_after","thesis_state_before","thesis_state_after"): setattr(review,field,getattr(payload,field))
+    review.snapshot_json={"returns":call_return_object(session,call),"completed_at":review.completed_at.isoformat()}
+    if payload.next_review_at: session.add(ThesisReview(user_id=user.id,tracked_call_id=call.id,review_type="scheduled",scheduled_for=payload.next_review_at,metadata_json={"created_by_review":review.id}))
+    session.commit(); return serialize_review(session,review)
+
+@app.post("/api/reviews/{review_id}/snooze")
+def snooze_review(review_id: str,payload: ReviewSnoozeRequest,user: CurrentUser=Depends(get_current_user),session: Session=Depends(get_session)):
+    if payload.snooze_until <= datetime.now(timezone.utc): raise HTTPException(422,"Snooze date must be in the future")
+    review=session.scalar(select(ThesisReview).where(ThesisReview.id==review_id,ThesisReview.user_id==user.id))
+    if not review: raise HTTPException(404,"Review not found")
+    review.review_status="snoozed"; review.scheduled_for=payload.snooze_until; review.explanation=payload.explanation; session.commit(); return serialize_review(session,review)
+
+@app.post("/api/reviews/{review_id}/dismiss")
+def dismiss_review(review_id: str,user: CurrentUser=Depends(get_current_user),session: Session=Depends(get_session)):
+    review=session.scalar(select(ThesisReview).where(ThesisReview.id==review_id,ThesisReview.user_id==user.id))
+    if not review: raise HTTPException(404,"Review not found")
+    review.review_status="dismissed"; session.commit(); return serialize_review(session,review)
+
+@app.get("/api/tickers/{symbol}/timeline")
+def ticker_timeline_api(symbol: str, kind: str="all", order: str="desc", user: CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    return ticker_timeline(session,user.id,symbol,kind,order)
+
+@app.get("/api/tickers/{symbol}/thinking-evolution")
+def ticker_evolution_api(symbol: str,scope: str="all",user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    return thinking_evolution(session,user.id,symbol,scope)
+
 
 @app.get("/api/export/calls.csv")
 def export_calls(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
@@ -531,6 +634,7 @@ web_root = Path(__file__).parents[2]
 @app.get("/tickers/{symbol}")
 @app.get("/settings")
 @app.get("/portfolio")
+@app.get("/review")
 @app.get("/login")
 def journal_route():
     """Serve the client shell for bookmarkable Phase 2 journal routes."""
