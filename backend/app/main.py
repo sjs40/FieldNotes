@@ -9,7 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteTag, PortfolioPosition, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, TrackedCall, TrackedCallLeg, UserReviewSettings
+from .models import BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, EmailConnection, InboxItem, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, TrackedCall, TrackedCallLeg, UserReviewSettings
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -19,6 +19,7 @@ from .observability import RequestObservabilityMiddleware, init_sentry, log_even
 from hashlib import sha256
 from .reviews import OUTCOMES, REVIEW_TYPES, STATUSES, generate as generate_reviews, serialize_review, settings_for
 from .timeline import thinking_evolution, ticker_timeline
+from .inbox import capture as inbox_capture, clean_html
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
@@ -80,6 +81,16 @@ class IBKRSyncRequest(BaseModel):
     base_currency: str = "USD"
     snapshot_at: datetime
     positions: list[dict]
+class CaptureRequest(BaseModel):
+    channel:str="web"; external_id:str|None=None; idempotency_key:str|None=None; item_type:str="text"; title:str=""; text:str=""; url:str|None=None; received_at:datetime|None=None; metadata:dict={}
+class SourceRequest(BaseModel):
+    source_type:str="manual"; external_id:str|None=None; url:str|None=None; title:str=""; content:str=""; metadata:dict={}
+class InboxPatchRequest(BaseModel):
+    status:str|None=None; title:str|None=None; text:str|None=None; tags:list[str]|None=None; tickers:list[str]|None=None
+class SourceLinkRequest(BaseModel):
+    note_id:str; relationship_type:str="references"; excerpt:str|None=None
+class BulkInboxRequest(BaseModel):
+    item_ids:list[str]; action:str; tag:str|None=None; ticker:str|None=None
 
 class ReviewCompleteRequest(BaseModel):
     outcome: str
@@ -462,13 +473,79 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
 
 
 @app.post("/api/capture")
-def capture(payload: ParseRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
-    parsed = parse_note(payload.body, payload.note_type)
-    if parsed["errors"]:
-        raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
-    note = create_note(session, user_id=user.id, parsed=parsed, title="", status="draft")
-    session.commit()
-    return {"note": serialized_note(session, note), "parse": parsed}
+def capture(payload: CaptureRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    item,parsed,replay=inbox_capture(session,user.id,payload.model_dump())
+    session.commit(); return {"item":{"id":item.id,"status":item.status,"source_id":item.source_id,"title":item.title},"parse":parsed,"idempotent_replay":replay}
+
+@app.get("/api/inbox")
+def inbox(status:str|None=None,item_type:str|None=None,ticker:str|None=None,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    q=select(InboxItem).where(InboxItem.user_id==user.id)
+    if status:q=q.where(InboxItem.status==status)
+    if item_type:q=q.where(InboxItem.item_type==item_type)
+    rows=session.scalars(q.order_by(InboxItem.received_at.desc())).all()
+    return [{"id":x.id,"type":x.item_type,"status":x.status,"channel":x.channel,"title":x.title,"excerpt":(x.raw_text or '')[:300],"source_id":x.source_id,"received_at":x.received_at.isoformat(),"metadata":x.metadata_json} for x in rows]
+@app.get("/api/inbox/{item_id}")
+def inbox_detail(item_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    x=session.scalar(select(InboxItem).where(InboxItem.id==item_id,InboxItem.user_id==user.id));
+    if not x:raise HTTPException(404,"Inbox item not found")
+    return {"id":x.id,"title":x.title,"text":x.raw_text,"status":x.status,"source_id":x.source_id,"metadata":x.metadata_json}
+@app.post("/api/inbox/{item_id}/create-note")
+def inbox_to_draft(item_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    item=session.scalar(select(InboxItem).where(InboxItem.id==item_id,InboxItem.user_id==user.id));
+    if not item:raise HTTPException(404,"Inbox item not found")
+    parsed=parse_note(item.raw_text or item.title or "",'note'); note=create_note(session,user_id=user.id,parsed=parsed,title=item.title or "",status='draft')
+    if item.source_id:session.add(NoteSource(note_id=note.id,source_id=item.source_id,relationship_type='derived_from',excerpt=(item.raw_text or '')[:500]))
+    item.status='converted';item.processed_at=datetime.now(timezone.utc);session.commit();return serialized_note(session,note)
+@app.post("/api/inbox/{item_id}/{action}")
+def inbox_action(item_id:str,action:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    item=session.scalar(select(InboxItem).where(InboxItem.id==item_id,InboxItem.user_id==user.id));
+    if not item or action not in {'archive','discard','retry'}:raise HTTPException(404,"Inbox item not found")
+    item.status={'archive':'archived','discard':'discarded','retry':'unprocessed'}[action];session.commit();return {"id":item.id,"status":item.status}
+@app.get("/api/sources")
+def sources(user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)): return [{"id":s.id,"type":s.source_type,"title":s.title,"url":s.canonical_url,"excerpt":s.excerpt,"status":s.content_status} for s in session.scalars(select(Source).where(Source.user_id==user.id).order_by(Source.created_at.desc())).all()]
+@app.get("/api/sources/{source_id}")
+def source_detail(source_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    s=session.scalar(select(Source).where(Source.id==source_id,Source.user_id==user.id));
+    if not s:raise HTTPException(404,"Source not found")
+    return {"id":s.id,"title":s.title,"url":s.canonical_url,"content":s.cleaned_content,"excerpt":s.excerpt,"metadata":s.metadata_json}
+@app.patch("/api/inbox/{item_id}")
+def patch_inbox(item_id:str,payload:InboxPatchRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    item=session.scalar(select(InboxItem).where(InboxItem.id==item_id,InboxItem.user_id==user.id));
+    if not item:raise HTTPException(404,"Inbox item not found")
+    if payload.status:
+        if payload.status not in {'unprocessed','reviewing','converted','published','archived','discarded','error'}:raise HTTPException(422,"Invalid inbox status")
+        item.status=payload.status
+    if payload.title is not None:item.title=payload.title[:500]
+    if payload.text is not None:item.raw_text=payload.text
+    item.metadata_json={**(item.metadata_json or {}),"user_tags":payload.tags or (item.metadata_json or {}).get('user_tags',[]),"user_tickers":payload.tickers or (item.metadata_json or {}).get('user_tickers',[])}
+    session.commit();return {"id":item.id,"status":item.status}
+@app.post("/api/inbox/bulk")
+def bulk_inbox(payload:BulkInboxRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    if payload.action not in {'archive','discard','processed','tag','ticker'}:raise HTTPException(422,"Unsupported bulk action")
+    rows=session.scalars(select(InboxItem).where(InboxItem.user_id==user.id,InboxItem.id.in_(payload.item_ids))).all()
+    for item in rows:
+        if payload.action in {'archive','discard','processed'}: item.status={'archive':'archived','discard':'discarded','processed':'converted'}[payload.action]
+        else:item.metadata_json={**(item.metadata_json or {}),('user_tags' if payload.action=='tag' else 'user_tickers'):[payload.tag if payload.action=='tag' else payload.ticker]}
+    session.commit();return {"updated":len(rows)}
+@app.post("/api/sources")
+def create_source(payload:SourceRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    item,_,_=inbox_capture(session,user.id,{"channel":"manual","item_type":"source","title":payload.title,"text":payload.content,"url":payload.url,"external_id":payload.external_id,"metadata":payload.metadata})
+    if not item.source_id:
+        source=Source(user_id=user.id,source_type=payload.source_type,title=payload.title,raw_content=payload.content,cleaned_content=clean_html(payload.content),excerpt=clean_html(payload.content)[:500],content_status='available',metadata_json=payload.metadata);session.add(source);session.flush();item.source_id=source.id
+    session.commit();return source_detail(item.source_id,user,session)
+@app.patch("/api/sources/{source_id}")
+def patch_source(source_id:str,payload:SourceRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    s=session.scalar(select(Source).where(Source.id==source_id,Source.user_id==user.id));
+    if not s:raise HTTPException(404,"Source not found")
+    if payload.title:s.title=payload.title[:500]
+    if payload.content:s.cleaned_content=clean_html(payload.content);s.excerpt=s.cleaned_content[:500]
+    s.metadata_json={**(s.metadata_json or {}),**payload.metadata};session.commit();return source_detail(s.id,user,session)
+@app.post("/api/sources/{source_id}/link-note")
+def link_source_note(source_id:str,payload:SourceLinkRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    source=session.scalar(select(Source).where(Source.id==source_id,Source.user_id==user.id));note=session.scalar(select(Note).where(Note.id==payload.note_id,Note.user_id==user.id))
+    if not source or not note:raise HTTPException(404,"Source or note not found")
+    if payload.relationship_type not in {'derived_from','supports','contradicts','references','quotes'}:raise HTTPException(422,"Invalid relationship")
+    session.merge(NoteSource(note_id=note.id,source_id=source.id,relationship_type=payload.relationship_type,excerpt=payload.excerpt));session.commit();return {"note_id":note.id,"source_id":source.id}
 
 
 @app.post("/api/market-data/refresh")
@@ -635,6 +712,8 @@ web_root = Path(__file__).parents[2]
 @app.get("/settings")
 @app.get("/portfolio")
 @app.get("/review")
+@app.get("/inbox")
+@app.get("/sources/{source_id}")
 @app.get("/login")
 def journal_route():
     """Serve the client shell for bookmarkable Phase 2 journal routes."""

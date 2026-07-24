@@ -101,6 +101,23 @@ changing a tracked call; a lifecycle action remains explicit. Portfolio holdings
 and FieldNotes calls are deliberately independent facts—neither one implies the
 other.
 
+## Inbox, sources, and future AI integration
+
+Sprint 3 stores capture and imported email content as Sources and Inbox items;
+users intentionally convert them to editable drafts. Imported content never
+opens a tracked call. Gmail is designed behind a read-only provider boundary;
+OAuth credentials must be encrypted server-side and never returned to clients.
+
+### Future AI Integration
+
+AI features are not implemented. Future low-risk assistance may suggest tags,
+tickers, related notes, and cited ticker-period summaries. Later phases may
+surface supporting or contradictory evidence, thesis drift, repeated themes,
+and reviewable signals. Any AI output must cite underlying notes/sources, show
+confidence, remain distinguishable from user writing, and enter review queues
+rather than mutating historical records. A future `NoteEnrichmentService`
+should run asynchronously and propose (never silently commit) enrichments.
+
 ## IBKR portfolio foundation
 
 Portfolio ingestion is read-only. Vercel cannot connect to TWS running on your
