@@ -224,6 +224,7 @@ class BrokerageConnection(Base):
     status: Mapped[str] = mapped_column(String(32), default="active")
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    sync_token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 

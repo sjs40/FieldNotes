@@ -17,6 +17,7 @@ from .journal import call_return_object, create_note, replace_note_relationships
 from .lifecycle import execute as execute_lifecycle
 from .observability import RequestObservabilityMiddleware, init_sentry, log_event
 from hashlib import sha256
+import secrets
 from .reviews import OUTCOMES, REVIEW_TYPES, STATUSES, generate as generate_reviews, serialize_review, settings_for
 from .timeline import thinking_evolution, ticker_timeline
 from .inbox import capture as inbox_capture, clean_html
@@ -74,13 +75,15 @@ class ExpectationRequest(BaseModel):
     explanation: str = Field(min_length=1)
 
 class IBKRSyncRequest(BaseModel):
-    user_id: str
+    user_id: str | None = None
     connection_name: str = "Interactive Brokers"
     account_id: str
     account_type: str | None = None
     base_currency: str = "USD"
     snapshot_at: datetime
     positions: list[dict]
+class IBKRConnectionRequest(BaseModel):
+    display_name:str="Interactive Brokers"; host:str="127.0.0.1"; port:int=7497; client_id:int=17
 class CaptureRequest(BaseModel):
     channel:str="web"; external_id:str|None=None; idempotency_key:str|None=None; item_type:str="text"; title:str=""; text:str=""; url:str|None=None; received_at:datetime|None=None; metadata:dict={}
 class SourceRequest(BaseModel):
@@ -342,17 +345,40 @@ def revise_expectation(call_id: str, payload: ExpectationRequest, user: CurrentU
     session.commit()
     return {"call": serialize_call(session, call)}
 
-def _sync_authorized(request: Request) -> None:
+def _sync_authorized(request: Request, session: Session) -> BrokerageConnection:
     token = request.headers.get("X-FieldNotes-Sync-Token", "")
-    if not settings.ibkr_sync_token or not token or token != settings.ibkr_sync_token:
+    token_hash=sha256(token.encode()).hexdigest() if token else ''
+    connection=session.scalar(select(BrokerageConnection).where(BrokerageConnection.sync_token_hash==token_hash, BrokerageConnection.provider=="ibkr"))
+    # Legacy global token remains supported only when explicitly configured.
+    if not connection and settings.ibkr_sync_token and token==settings.ibkr_sync_token:
+        connection=None
+    elif not connection:
         raise HTTPException(status_code=401, detail="Invalid sync credential")
+    return connection
+
+@app.get("/api/integrations/ibkr/status")
+def ibkr_status(user: CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    return [{"id":c.id,"display_name":c.display_name,"status":c.status,"last_synced_at":c.last_synced_at,"configured":bool(c.sync_token_hash)} for c in session.scalars(select(BrokerageConnection).where(BrokerageConnection.user_id==user.id,BrokerageConnection.provider=="ibkr")).all()]
+
+@app.post("/api/integrations/ibkr/connect")
+def ibkr_connect(payload:IBKRConnectionRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    connection=BrokerageConnection(user_id=user.id,provider="ibkr",display_name=payload.display_name,status="awaiting_sync",metadata_json={"host":payload.host,"port":payload.port,"client_id":payload.client_id})
+    token=secrets.token_urlsafe(32);connection.sync_token_hash=sha256(token.encode()).hexdigest();session.add(connection);session.commit()
+    return {"connection":{"id":connection.id,"status":connection.status,"display_name":connection.display_name},"sync_token":token,"agent_config":{"FIELDNOTES_API_URL":"<your FieldNotes URL>","FIELDNOTES_SYNC_TOKEN":token,"IBKR_HOST":payload.host,"IBKR_PORT":str(payload.port),"IBKR_CLIENT_ID":str(payload.client_id)},"warning":"Save this token now; it is never shown again. FieldNotes is read-only and cannot trade."}
+
+@app.post("/api/integrations/ibkr/{connection_id}/rotate-token")
+def ibkr_rotate(connection_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    connection=session.scalar(select(BrokerageConnection).where(BrokerageConnection.id==connection_id,BrokerageConnection.user_id==user.id));
+    if not connection:raise HTTPException(404,"Connection not found")
+    token=secrets.token_urlsafe(32);connection.sync_token_hash=sha256(token.encode()).hexdigest();session.commit();return {"sync_token":token,"warning":"Replace the token in your local agent now; it is never shown again."}
 
 @app.post("/api/integrations/ibkr/sync")
 def ibkr_sync(payload: IBKRSyncRequest, request: Request, session: Session = Depends(get_session)):
-    _sync_authorized(request)
+    authorized_connection=_sync_authorized(request,session)
     account_hash = sha256(payload.account_id.encode()).hexdigest()
-    connection = session.scalar(select(BrokerageConnection).where(BrokerageConnection.user_id == payload.user_id, BrokerageConnection.provider == "ibkr"))
+    connection = authorized_connection or session.scalar(select(BrokerageConnection).where(BrokerageConnection.user_id == payload.user_id, BrokerageConnection.provider == "ibkr"))
     if not connection:
+        if not payload.user_id: raise HTTPException(401,"A provisioned connection is required")
         connection = BrokerageConnection(user_id=payload.user_id, provider="ibkr", display_name=payload.connection_name); session.add(connection); session.flush()
     account = session.scalar(select(BrokerageAccount).where(BrokerageAccount.connection_id == connection.id, BrokerageAccount.external_account_id_hash == account_hash))
     if not account:
@@ -362,7 +388,7 @@ def ibkr_sync(payload: IBKRSyncRequest, request: Request, session: Session = Dep
     for row in payload.positions:
         symbol = str(row["symbol"]).upper(); security = session.scalar(select(Security).where(Security.symbol == symbol)) or Security(symbol=symbol, currency=row.get("currency", payload.base_currency)); session.add(security); session.flush()
         session.add(PortfolioPosition(brokerage_account_id=account.id, security_id=security.id, external_contract_id=row.get("contract_id"), quantity=row["quantity"], average_cost=row.get("average_cost"), market_price=row.get("market_price"), market_value=row.get("market_value"), unrealized_pnl=row.get("unrealized_pnl"), realized_pnl=row.get("realized_pnl"), currency=row.get("currency", payload.base_currency), snapshot_at=payload.snapshot_at, metadata_json={"source": "ibkr_sync_agent"}))
-    connection.last_synced_at = account.last_synced_at = payload.snapshot_at; session.commit(); log_event("ibkr_sync", user_id=payload.user_id, position_count=len(payload.positions))
+    connection.last_synced_at = account.last_synced_at = payload.snapshot_at; connection.status="connected";session.commit(); log_event("ibkr_sync", user_id=connection.user_id, position_count=len(payload.positions))
     return {"status": "ok", "idempotent_replay": False}
 
 @app.get("/api/portfolio/accounts")

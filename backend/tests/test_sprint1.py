@@ -41,4 +41,10 @@ class SprintOneTests(unittest.TestCase):
         response = self.client.post("/api/integrations/ibkr/sync", json={"user_id":"user-1", "account_id":"U123", "snapshot_at":"2026-07-23T00:00:00Z", "positions":[]})
         self.assertEqual(response.status_code, 401)
 
+    def test_provisioned_ibkr_connection_issues_one_time_agent_token(self):
+        response = self.client.post("/api/integrations/ibkr/connect", json={"port": 7497})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("sync_token", response.json())
+        self.assertEqual(self.client.get("/api/integrations/ibkr/status").json()[0]["status"], "awaiting_sync")
+
 if __name__ == "__main__": unittest.main()
