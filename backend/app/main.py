@@ -5,11 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, InboxItem, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings
+from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, Idea, IdeaSecurity, InboxItem, MetricCard, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings, WeeklyReview
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -127,6 +127,21 @@ class SavedViewRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     resource: str = Field(pattern="^(notes|questions|forecasts|tickers)$")
     filters: dict = {}
+    sort: dict = {}
+    columns: dict = {}
+    is_default: bool = False
+    is_pinned: bool = False
+
+class MetricCardRequest(BaseModel):
+    metric_name:str=Field(min_length=1,max_length=255); value:float; period:str=Field(min_length=1,max_length=128); ticker:str|None=None; value_unit:str|None=None; prior_value:float|None=None; consensus_value:float|None=None; note_id:str|None=None; source_id:str|None=None; forecast_id:str|None=None; interpretation:str|None=None; data:dict={}
+class IdeaRequest(BaseModel):
+    title:str=Field(min_length=1,max_length=500); description:str|None=None; stage:str="spark"; priority:str="medium"; ticker_symbols:list[str]=[]; originating_note_id:str|None=None; source_id:str|None=None; why_it_matters:str|None=None; why_now:str|None=None; next_step:str|None=None; rejection_reason:str|None=None
+class WeeklyReviewRequest(BaseModel):
+    week_start:datetime|None=None; conclusions:dict={}; complete:bool=False
+class TableParseRequest(BaseModel):
+    text:str=Field(min_length=1,max_length=50000)
+class ChartRequest(BaseModel):
+    metric_card_id:str; chart_type:str="line"
 
 
 class LifecycleRequest(BaseModel):
@@ -616,20 +631,74 @@ def challenge_thesis(note_id:str,payload:ChallengeRequest,user:CurrentUser=Depen
         session.add(EvidenceThesis(evidence_id=eid,thesis_note_id=thesis.id))
     session.commit();return serialized_note(session,note)
 
+def _validate_view_filters(resource,filters):
+    allowed={"notes":{"ticker","tag","note_type","status","relationship_type","has_unresolved_questions","date_from","date_to"},"questions":{"ticker","status","priority","due_before"},"forecasts":{"ticker","status","target_before"},"ideas":{"stage","priority","ticker"}}
+    if resource not in allowed or not isinstance(filters,dict):raise HTTPException(422,"Invalid saved view")
+    if "and" in filters or "or" in filters:
+        branches=filters.get("and",filters.get("or"));
+        if not isinstance(branches,list) or not branches:raise HTTPException(422,"Filter groups require a non-empty list")
+        for branch in branches:_validate_view_filters(resource,branch)
+        return
+    unknown=set(filters)-allowed[resource]
+    if unknown:raise HTTPException(422,detail={"message":"Unsupported filter fields","fields":sorted(unknown)})
+
 @app.post("/api/saved-views")
 def save_view(payload:SavedViewRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
-    value=SavedView(user_id=user.id,name=payload.name,resource=payload.resource,filters_json=payload.filters);session.add(value)
+    _validate_view_filters(payload.resource,payload.filters)
+    value=SavedView(user_id=user.id,name=payload.name,resource=payload.resource,filters_json=payload.filters,sort_json=payload.sort,columns_json=payload.columns,is_default=payload.is_default,is_pinned=payload.is_pinned);session.add(value)
     try:session.commit()
     except Exception:
         session.rollback();raise HTTPException(409,"A saved view with that name already exists")
-    return {"id":value.id,"name":value.name,"resource":value.resource,"filters":value.filters_json}
+    return {"id":value.id,"name":value.name,"resource":value.resource,"filters":value.filters_json,"sort":value.sort_json,"pinned":value.is_pinned}
 
 @app.get("/api/saved-views")
 def saved_views(resource:str|None=None,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
     q=select(SavedView).where(SavedView.user_id==user.id)
     if resource:q=q.where(SavedView.resource==resource)
     rows=session.scalars(q.order_by(SavedView.updated_at.desc())).all()
-    return [{"id":x.id,"name":x.name,"resource":x.resource,"filters":x.filters_json} for x in rows]
+    return [{"id":x.id,"name":x.name,"resource":x.resource,"filters":x.filters_json,"sort":x.sort_json,"pinned":x.is_pinned} for x in rows]
+
+@app.get("/api/saved-views/{view_id}/results")
+def saved_view_results(view_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    view=session.scalar(select(SavedView).where(SavedView.id==view_id,SavedView.user_id==user.id))
+    if not view:raise HTTPException(404,"Saved view not found")
+    f=view.filters_json or {}
+    def groups(value, predicate):
+        if "and" in value:return and_(*[groups(x,predicate) for x in value["and"]])
+        if "or" in value:return or_(*[groups(x,predicate) for x in value["or"]])
+        return predicate(value)
+    if view.resource=="questions":
+        q=select(ResearchQuestion).where(ResearchQuestion.user_id==user.id)
+        def question_pred(x):
+            terms=[]
+            if x.get("status"):terms.append(ResearchQuestion.status==x["status"])
+            if x.get("priority"):terms.append(ResearchQuestion.priority==x["priority"])
+            if x.get("ticker"):
+                s=_security_for_ticker(session,x["ticker"]);terms.append(ResearchQuestion.security_id==s.id if s else False)
+            return and_(*terms) if terms else True
+        q=q.where(groups(f,question_pred))
+        return [{"id":x.id,"question":x.question,"status":x.status,"priority":x.priority} for x in session.scalars(q).all()]
+    if view.resource=="forecasts":
+        q=select(Forecast).where(Forecast.user_id==user.id)
+        q=q.where(groups(f,lambda x: Forecast.status==x["status"] if x.get("status") else True))
+        return [{"id":x.id,"metric_name":x.metric_name,"status":x.status} for x in session.scalars(q).all()]
+    if view.resource=="ideas":
+        q=select(Idea).where(Idea.user_id==user.id)
+        q=q.where(groups(f,lambda x: and_(*(z for z in [Idea.stage==x["stage"] if x.get("stage") else True,Idea.priority==x["priority"] if x.get("priority") else True] if z is not True))))
+        return [{"id":x.id,"title":x.title,"stage":x.stage,"priority":x.priority} for x in session.scalars(q).all()]
+    q=select(Note).where(Note.user_id==user.id)
+    def note_pred(x):
+        terms=[]
+        if x.get("note_type"):terms.append(Note.type==x["note_type"])
+        if x.get("status"):terms.append(Note.status==x["status"])
+        if x.get("has_unresolved_questions"):terms.append(select(ResearchQuestion.id).where(ResearchQuestion.originating_note_id==Note.id,ResearchQuestion.status.in_(("open","partially_answered"))).exists())
+        return and_(*terms) if terms else True
+    q=q.where(groups(f,note_pred))
+    return [serialized_note(session,x) for x in session.scalars(q.order_by(Note.updated_at.desc())).all()]
+
+@app.get("/api/saved-views/defaults")
+def default_views():
+    return [{"name":"Critical unresolved questions","resource":"questions","filters":{"status":"open","priority":"critical"}},{"name":"Ideas worth investigating","resource":"ideas","filters":{"stage":"worth_investigating"}},{"name":"Open forecasts","resource":"forecasts","filters":{"status":"open"}},{"name":"Notes with unresolved questions","resource":"notes","filters":{"has_unresolved_questions":True}}]
 
 @app.get("/api/research-reviews/{period}")
 def research_review(period:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
@@ -643,6 +712,105 @@ def research_review(period:str,user:CurrentUser=Depends(get_current_user),sessio
     questions=session.scalars(select(ResearchQuestion).where(ResearchQuestion.user_id==user.id,ResearchQuestion.status.in_(("open","partially_answered"))).order_by(ResearchQuestion.priority.desc()).limit(10)).all()
     forecasts=session.scalars(select(Forecast).where(Forecast.user_id==user.id,Forecast.status=="resolved",Forecast.resolved_at>=since)).all()
     return {"period":period,"from":since.isoformat(),"to":now.isoformat(),"new_notes":len(notes),"thinking_updates":[{"id":x.id,"direction":x.change_direction,"reason":x.change_reason,"at":x.created_at.isoformat()} for x in updates],"open_questions":[{"id":x.id,"question":x.question,"priority":x.priority} for x in questions],"resolved_forecasts":[{"id":x.id,"metric":x.metric_name,"outcome":x.outcome} for x in forecasts]}
+
+@app.post("/api/metric-cards")
+def create_metric_card(payload:MetricCardRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    security=_security_for_ticker(session,payload.ticker)
+    if payload.note_id:_owned_note(session,payload.note_id,user.id)
+    if payload.source_id and not session.scalar(select(Source).where(Source.id==payload.source_id,Source.user_id==user.id)):raise HTTPException(404,"Source not found")
+    if payload.forecast_id and not session.scalar(select(Forecast).where(Forecast.id==payload.forecast_id,Forecast.user_id==user.id)):raise HTTPException(404,"Forecast not found")
+    value=MetricCard(user_id=user.id,security_id=security.id if security else None,note_id=payload.note_id,source_id=payload.source_id,forecast_id=payload.forecast_id,metric_name=payload.metric_name,value=payload.value,period=payload.period,value_unit=payload.value_unit,prior_value=payload.prior_value,consensus_value=payload.consensus_value,interpretation=payload.interpretation,data_json=payload.data);session.add(value);session.commit();return {"id":value.id,"metric_name":value.metric_name,"value":float(value.value),"period":value.period}
+
+@app.get("/api/metric-cards")
+def metric_cards(ticker:str|None=None,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    q=select(MetricCard).where(MetricCard.user_id==user.id)
+    if ticker:
+        security=_security_for_ticker(session,ticker);q=q.where(MetricCard.security_id==security.id) if security else q.where(False)
+    return [{"id":x.id,"metric_name":x.metric_name,"value":float(x.value),"unit":x.value_unit,"period":x.period,"data":x.data_json} for x in session.scalars(q.order_by(MetricCard.created_at.desc())).all()]
+
+@app.post("/api/tables/parse")
+def parse_table(payload:TableParseRequest):
+    lines=[x.strip() for x in payload.text.strip().splitlines() if x.strip()]
+    rows=[]
+    for line in lines:
+        cells=[x.strip() for x in (line.strip("|").split("|") if "|" in line else line.split("\t"))]
+        if cells and not all(set(x)<=set("-: ") for x in cells):rows.append(cells)
+    if len(rows)<2:raise HTTPException(422,"Provide a header and at least one data row")
+    width=len(rows[0])
+    if width>30 or any(len(x)!=width for x in rows):raise HTTPException(422,"Table rows must have a consistent, safe column count")
+    return {"columns":rows[0],"rows":rows[1:]}
+
+@app.post("/api/charts")
+def chart_config(payload:ChartRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    if payload.chart_type not in {"line","bar","scatter"}:raise HTTPException(422,"Unsupported chart type")
+    card=session.scalar(select(MetricCard).where(MetricCard.id==payload.metric_card_id,MetricCard.user_id==user.id))
+    if not card:raise HTTPException(404,"Metric card not found")
+    data=card.data_json or {};points=data.get("points",[])
+    if not isinstance(points,list) or not all(isinstance(x,dict) and "x" in x and "y" in x for x in points):raise HTTPException(422,"Metric card needs structured points with x and y values")
+    return {"type":payload.chart_type,"title":card.metric_name,"series":[{"name":card.metric_name,"points":points}],"unit":card.value_unit}
+
+@app.post("/api/ideas")
+def create_idea(payload:IdeaRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    stages={"spark","worth_investigating","active_research","candidate_thesis","waiting_for_trigger","dormant","rejected","promoted_to_thesis"}
+    if payload.stage not in stages or payload.priority not in {"low","medium","high","critical"}:raise HTTPException(422,"Invalid idea stage or priority")
+    if payload.originating_note_id:_owned_note(session,payload.originating_note_id,user.id)
+    if payload.source_id and not session.scalar(select(Source).where(Source.id==payload.source_id,Source.user_id==user.id)):raise HTTPException(404,"Source not found")
+    value=Idea(user_id=user.id,title=payload.title,description=payload.description,stage=payload.stage,priority=payload.priority,originating_note_id=payload.originating_note_id,source_id=payload.source_id,why_it_matters=payload.why_it_matters,why_now=payload.why_now,next_step=payload.next_step,rejection_reason=payload.rejection_reason);session.add(value);session.flush()
+    for symbol in set(payload.ticker_symbols):
+        security=_security_for_ticker(session,symbol)
+        if not security:security=Security(symbol=symbol.upper());session.add(security);session.flush()
+        session.add(IdeaSecurity(idea_id=value.id,security_id=security.id))
+    session.commit();return {"id":value.id,"title":value.title,"stage":value.stage}
+
+@app.get("/api/ideas")
+def ideas(stage:str|None=None,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    q=select(Idea).where(Idea.user_id==user.id)
+    if stage:q=q.where(Idea.stage==stage)
+    rows=session.scalars(q.order_by(Idea.updated_at.desc())).all();return [{"id":x.id,"title":x.title,"description":x.description,"stage":x.stage,"priority":x.priority,"next_step":x.next_step,"updated_at":x.updated_at.isoformat()} for x in rows]
+
+@app.post("/api/ideas/{idea_id}/promote")
+def promote_idea(idea_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    idea=session.scalar(select(Idea).where(Idea.id==idea_id,Idea.user_id==user.id))
+    if not idea:raise HTTPException(404,"Idea not found")
+    symbols=session.scalars(select(Security.symbol).join(IdeaSecurity,IdeaSecurity.security_id==Security.id).where(IdeaSecurity.idea_id==idea.id)).all();body=(" ".join("$"+x for x in symbols)+" "+(idea.description or idea.title)).strip();note=create_note(session,user_id=user.id,parsed=parse_note(body,"thesis"),title=idea.title,status="published",quotes={});idea.stage="promoted_to_thesis";idea.promoted_thesis_note_id=note.id
+    if idea.originating_note_id:session.add(NoteRelationship(user_id=user.id,from_note_id=note.id,to_note_id=idea.originating_note_id,relationship_type="converts_to",created_by_workflow="idea_promotion"))
+    session.commit();return serialized_note(session,note)
+
+@app.get("/api/workspaces/daily")
+def daily_workspace(user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    now=datetime.now(timezone.utc)
+    inbox=session.scalars(select(InboxItem).where(InboxItem.user_id==user.id,InboxItem.status=="unprocessed").order_by(InboxItem.received_at.desc()).limit(20)).all()
+    questions=session.scalars(select(ResearchQuestion).where(ResearchQuestion.user_id==user.id,ResearchQuestion.status.in_(("open","partially_answered")),or_(ResearchQuestion.priority=="critical",ResearchQuestion.due_at<=now)).order_by(ResearchQuestion.priority.desc()).limit(20)).all()
+    drafts=session.scalars(select(Note).where(Note.user_id==user.id,Note.status=="draft").order_by(Note.updated_at.desc()).limit(10)).all()
+    return {"inbox":[{"id":x.id,"title":x.title,"type":x.item_type} for x in inbox],"questions":[{"id":x.id,"question":x.question,"priority":x.priority} for x in questions],"drafts":[{"id":x.id,"title":x.title or x.body[:80]} for x in drafts],"reviews":research_review("daily",user,session)["thinking_updates"]}
+
+@app.post("/api/workspaces/weekly")
+def weekly_workspace(payload:WeeklyReviewRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    from datetime import timedelta
+    now=datetime.now(timezone.utc);start=(payload.week_start or now).replace(hour=0,minute=0,second=0,microsecond=0);start-=timedelta(days=start.weekday());end=start+timedelta(days=7)
+    summary={"notes":session.scalar(select(func.count(Note.id)).where(Note.user_id==user.id,Note.created_at>=start,Note.created_at<end)) or 0,"ideas":session.scalar(select(func.count(Idea.id)).where(Idea.user_id==user.id,Idea.created_at>=start,Idea.created_at<end)) or 0,"evidence":session.scalar(select(func.count(Evidence.id)).where(Evidence.user_id==user.id,Evidence.created_at>=start,Evidence.created_at<end)) or 0,"questions_created":session.scalar(select(func.count(ResearchQuestion.id)).where(ResearchQuestion.user_id==user.id,ResearchQuestion.created_at>=start,ResearchQuestion.created_at<end)) or 0,"forecasts":session.scalar(select(func.count(Forecast.id)).where(Forecast.user_id==user.id,Forecast.created_at>=start,Forecast.created_at<end)) or 0,"sources":session.scalar(select(func.count(Source.id)).where(Source.user_id==user.id,Source.created_at>=start,Source.created_at<end)) or 0}
+    review=session.scalar(select(WeeklyReview).where(WeeklyReview.user_id==user.id,WeeklyReview.week_start==start)) or WeeklyReview(user_id=user.id,week_start=start,week_end=end);review.summary_json=summary;review.conclusions_json=payload.conclusions;review.completed_at=now if payload.complete else None;session.add(review);session.commit();return {"id":review.id,"week_start":start.isoformat(),"summary":summary,"completed":bool(review.completed_at)}
+
+@app.get("/api/patterns")
+def patterns(minimum_sample:int=3,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    rows=[]
+    ticker_rows=session.execute(select(Security.symbol,func.count(Note.id)).join(NoteSecurityMention,NoteSecurityMention.security_id==Security.id).join(Note,Note.id==NoteSecurityMention.note_id).where(Note.user_id==user.id).group_by(Security.symbol).having(func.count(Note.id)>=minimum_sample)).all()
+    for symbol,count in ticker_rows:
+        thesis_count=session.scalar(select(func.count(Note.id)).join(NoteSecurityMention,NoteSecurityMention.note_id==Note.id).join(Security,Security.id==NoteSecurityMention.security_id).where(Note.user_id==user.id,Security.symbol==symbol,Note.type=="thesis")) or 0
+        if not thesis_count:rows.append({"title":f"${symbol} has research volume but no thesis","rule":"At least minimum_sample notes and zero thesis notes","count":count,"low_sample":count<5,"ticker":symbol})
+    unresolved=session.scalar(select(func.count(ResearchQuestion.id)).where(ResearchQuestion.user_id==user.id,ResearchQuestion.status.in_(("open","partially_answered")))) or 0
+    if unresolved>=minimum_sample:rows.append({"title":"Open research-question backlog","rule":"Count of unresolved questions","count":unresolved,"low_sample":unresolved<5})
+    forecasts=session.scalars(select(Forecast).where(Forecast.user_id==user.id,Forecast.status=="resolved")).all()
+    if len(forecasts)>=minimum_sample:
+        correct=[x for x in forecasts if x.outcome=="correct"];rows.append({"title":"Forecast resolution accuracy","rule":"Resolved forecasts classified correct divided by all resolved forecasts","count":len(forecasts),"value":len(correct)/len(forecasts),"low_sample":len(forecasts)<5,"record_ids":[x.id for x in forecasts]})
+        errors=[float(x.error_percentage) for x in forecasts if x.error_percentage is not None]
+        if errors:rows.append({"title":"Forecast bias","rule":"Mean signed percentage error across resolved point forecasts","count":len(errors),"value":sum(errors)/len(errors),"low_sample":len(errors)<5,"record_ids":[x.id for x in forecasts if x.error_percentage is not None]})
+    challenged=session.scalars(select(Assumption).where(Assumption.user_id==user.id,Assumption.status=="challenged")).all()
+    if len(challenged)>=minimum_sample:rows.append({"title":"Challenged assumptions need resolution","rule":"Assumptions currently marked challenged","count":len(challenged),"low_sample":len(challenged)<5,"record_ids":[x.id for x in challenged]})
+    calls=session.scalars(select(TrackedCall).where(TrackedCall.user_id==user.id,TrackedCall.status.in_(("closed","invalidated")))).all()
+    if len(calls)>=minimum_sample:
+        invalidated=[x for x in calls if x.status=="invalidated"];rows.append({"title":"Call invalidation rate","rule":"Invalidated terminal calls divided by terminal calls","count":len(calls),"value":len(invalidated)/len(calls),"low_sample":len(calls)<5,"record_ids":[x.id for x in calls]})
+    return rows
 
 
 @app.get("/api/calls")

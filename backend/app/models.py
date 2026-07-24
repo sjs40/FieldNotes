@@ -364,9 +364,31 @@ class SavedView(Base):
     name: Mapped[str] = mapped_column(String(120))
     resource: Mapped[str] = mapped_column(String(32))
     filters_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    sort_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    columns_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (UniqueConstraint("user_id", "resource", "name", name="uq_saved_view_name"),)
+
+class MetricCard(Base):
+    __tablename__="metric_cards"
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); user_id: Mapped[str]=mapped_column(String(36),index=True); security_id: Mapped[str|None]=mapped_column(ForeignKey("securities.id"),nullable=True,index=True); note_id: Mapped[str|None]=mapped_column(ForeignKey("notes.id"),nullable=True); source_id: Mapped[str|None]=mapped_column(ForeignKey("sources.id"),nullable=True); forecast_id: Mapped[str|None]=mapped_column(ForeignKey("forecasts.id"),nullable=True)
+    metric_name: Mapped[str]=mapped_column(String(255)); metric_definition: Mapped[str|None]=mapped_column(Text,nullable=True); value: Mapped[float]=mapped_column(Numeric(20,6)); value_unit: Mapped[str|None]=mapped_column(String(32),nullable=True); period: Mapped[str]=mapped_column(String(128)); prior_value: Mapped[float|None]=mapped_column(Numeric(20,6),nullable=True); consensus_value: Mapped[float|None]=mapped_column(Numeric(20,6),nullable=True); source_excerpt: Mapped[str|None]=mapped_column(Text,nullable=True); interpretation: Mapped[str|None]=mapped_column(Text,nullable=True); data_json: Mapped[dict]=mapped_column(JSON,default=dict); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=datetime.utcnow); updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=datetime.utcnow,onupdate=datetime.utcnow)
+
+class Idea(Base):
+    __tablename__="ideas"
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); user_id: Mapped[str]=mapped_column(String(36),index=True); originating_note_id: Mapped[str|None]=mapped_column(ForeignKey("notes.id"),nullable=True); source_id: Mapped[str|None]=mapped_column(ForeignKey("sources.id"),nullable=True); promoted_thesis_note_id: Mapped[str|None]=mapped_column(ForeignKey("notes.id"),nullable=True)
+    title: Mapped[str]=mapped_column(String(500)); description: Mapped[str|None]=mapped_column(Text,nullable=True); why_it_matters: Mapped[str|None]=mapped_column(Text,nullable=True); why_now: Mapped[str|None]=mapped_column(Text,nullable=True); expressions: Mapped[str|None]=mapped_column(Text,nullable=True); next_step: Mapped[str|None]=mapped_column(Text,nullable=True); priority: Mapped[str]=mapped_column(String(16),default="medium"); stage: Mapped[str]=mapped_column(String(32),default="spark",index=True); review_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True); rejection_reason: Mapped[str|None]=mapped_column(Text,nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=datetime.utcnow); updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=datetime.utcnow,onupdate=datetime.utcnow)
+
+class IdeaSecurity(Base):
+    __tablename__="idea_securities"; idea_id: Mapped[str]=mapped_column(ForeignKey("ideas.id"),primary_key=True); security_id: Mapped[str]=mapped_column(ForeignKey("securities.id"),primary_key=True)
+
+class WeeklyReview(Base):
+    __tablename__="weekly_reviews"
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); user_id: Mapped[str]=mapped_column(String(36),index=True); week_start: Mapped[datetime]=mapped_column(DateTime(timezone=True)); week_end: Mapped[datetime]=mapped_column(DateTime(timezone=True)); summary_json: Mapped[dict]=mapped_column(JSON,default=dict); conclusions_json: Mapped[dict]=mapped_column(JSON,default=dict); completed_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=datetime.utcnow); updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=datetime.utcnow,onupdate=datetime.utcnow)
+    __table_args__=(UniqueConstraint("user_id","week_start",name="uq_weekly_review_period"),)
 
 
 class ThesisDetails(Base):
