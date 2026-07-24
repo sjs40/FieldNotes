@@ -1,10 +1,18 @@
 (function () {
   const KEY = 'fieldnotes.supabase.access-token';
   const REFRESH_KEY = 'fieldnotes.supabase.refresh-token';
+  const SESSION_VERSION_KEY = 'fieldnotes.supabase.session-version';
+  const SESSION_VERSION = '2';
   const nativeFetch = window.fetch.bind(window);
   const state = { enabled: false, config: null };
   const token = () => localStorage.getItem(KEY);
   const refreshToken = () => localStorage.getItem(REFRESH_KEY);
+  // A prior build could retain an account token while rendering an empty local
+  // journal. Require one explicit sign-in after the auth-scope migration.
+  if (localStorage.getItem(SESSION_VERSION_KEY) !== SESSION_VERSION) {
+    localStorage.removeItem(KEY); localStorage.removeItem(REFRESH_KEY);
+    localStorage.setItem(SESSION_VERSION_KEY, SESSION_VERSION);
+  }
   const tokenExpiresSoon = value => {
     try {
       const payload = JSON.parse(atob(value.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
