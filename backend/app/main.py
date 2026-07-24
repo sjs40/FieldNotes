@@ -9,7 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, EmailConnection, InboxItem, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, TrackedCall, TrackedCallLeg, UserReviewSettings
+from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, InboxItem, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings
 from .parser import parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -41,12 +41,92 @@ class PublishRequest(BaseModel):
     note_type: str = "note"
     title: str = ""
     thesis_details: dict | None = None
+    pending_questions: list[dict] = []
 
 
 class EditNoteRequest(BaseModel):
     body: str
     note_type: str = "note"
     title: str = ""
+
+class FollowUpRequest(PublishRequest):
+    relationship_type: str = "updates"
+    explanation: str | None = None
+    thinking_update: dict | None = None
+
+class LedgerRequest(BaseModel):
+    statement: str = Field(min_length=1, max_length=10000)
+    ticker: str | None = None
+    status: str | None = None
+    importance: str | None = None
+    direction: str | None = None
+    strength: str | None = None
+    source_id: str | None = None
+    assumption_ids: list[str] = []
+    thesis_note_ids: list[str] = []
+    forecast_ids: list[str] = []
+    question_ids: list[str] = []
+    note_id: str | None = None
+    priority: str | None = None
+    due_at: datetime | None = None
+
+class ForecastRequest(BaseModel):
+    metric_name: str = Field(min_length=1, max_length=255)
+    ticker: str | None = None
+    forecast_type: str = "point"
+    target_value: float | None = None
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+    value_unit: str | None = None
+    direction: str | None = None
+    probability: float | None = Field(default=None, ge=0, le=1)
+    target_period_start: datetime
+    target_period_end: datetime | None = None
+    note_id: str | None = None
+    assumption_id: str | None = None
+
+class ForecastResolutionRequest(BaseModel):
+    resolution_value: float | None = None
+    outcome: str
+    resolution_source_id: str | None = None
+    resolution_note: str | None = None
+
+class UpdateAssumptionRequest(BaseModel):
+    status: str | None = None
+    importance: str | None = None
+    current_value: str | None = None
+    explanation: str | None = None
+
+class AnswerQuestionRequest(BaseModel):
+    status: str = "answered"
+    answer_summary: str | None = None
+    answered_by_note_id: str | None = None
+    answered_by_source_id: str | None = None
+
+class ConvertRequest(BaseModel):
+    target_type: str
+    title: str = ""
+    body: str | None = None
+    statement: str | None = None
+    ticker: str | None = None
+    priority: str = "medium"
+
+class ChallengeRequest(BaseModel):
+    title: str = "Challenge thesis"
+    opposing_case: str | None = None
+    weakest_assumption: str | None = None
+    discounted_evidence: str | None = None
+    market_knows: str | None = None
+    delayed_catalyst: str | None = None
+    fundamental_vs_stock: str | None = None
+    ticker: str | None = None
+    assumption_ids: list[str] = []
+    evidence_ids: list[str] = []
+
+class SavedViewRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    resource: str = Field(pattern="^(notes|questions|forecasts|tickers)$")
+    filters: dict = {}
 
 
 class LifecycleRequest(BaseModel):
@@ -118,6 +198,11 @@ class ReviewSettingsRequest(BaseModel):
 
 def serialized_note(session: Session, note: Note) -> dict:
     result = serialize_journal_note(session, note)
+    relations=session.scalars(select(NoteRelationship).where(or_(NoteRelationship.from_note_id==note.id,NoteRelationship.to_note_id==note.id))).all()
+    outgoing=[r for r in relations if r.from_note_id==note.id]; incoming=[r for r in relations if r.to_note_id==note.id]
+    result["relationship_summary"]={"follow_up_count":len(incoming),"supporting_count":sum(r.relationship_type=="supports" for r in relations),"contradiction_count":sum(r.relationship_type=="contradicts" for r in relations),"superseded_by":next((r.from_note_id for r in incoming if r.relationship_type=="supersedes"),None)}
+    result["open_question_count"]=session.scalar(select(func.count(ResearchQuestion.id)).where(ResearchQuestion.originating_note_id==note.id,ResearchQuestion.status.in_(("open","partially_answered")))) or 0
+    result["evidence_count"]=session.scalar(select(func.count(Evidence.id)).where(Evidence.originating_note_id==note.id)) or 0
     details = session.scalar(select(ThesisDetails).where(ThesisDetails.note_id == note.id))
     if details:
         result["thesis_details"] = {"core_thesis": details.core_thesis, "key_evidence": details.key_evidence_json, "catalysts": details.catalysts_json, "risks": details.risks_json, "invalidation_conditions": details.invalidation_conditions_json, "valuation_notes": details.valuation_notes, "expected_time_horizon_days": details.expected_time_horizon_days, "review_at": details.review_at.isoformat() if details.review_at else None}
@@ -249,6 +334,7 @@ async def create_draft(payload: PublishRequest, user: CurrentUser = Depends(get_
         raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
     note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="draft")
     save_thesis_details(session, note.id, payload.thesis_details)
+    _create_pending_questions(session, user.id, note, payload.pending_questions)
     session.commit()
     return serialized_note(session, note)
 
@@ -277,6 +363,29 @@ async def list_revisions(note_id: str, user: CurrentUser = Depends(get_current_u
     revisions = session.scalars(select(NoteRevision).where(NoteRevision.note_id == note.id).order_by(NoteRevision.revision_number.desc())).all()
     return [{"id": revision.id, "revision_number": revision.revision_number, "title": revision.title or "", "body": revision.body, "type": revision.type, "edited_at": revision.edited_at.isoformat()} for revision in revisions]
 
+@app.get("/api/notes/{note_id}/deltas")
+def note_deltas(note_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    import difflib
+    note=_owned_note(session,note_id,user.id)
+    revisions=session.scalars(select(NoteRevision).where(NoteRevision.note_id==note.id).order_by(NoteRevision.revision_number)).all()
+    deltas=[]
+    for before,after in zip(revisions,revisions[1:]):
+        diff=list(difflib.ndiff((before.body or "").splitlines(),(after.body or "").splitlines()))
+        added=[line[2:] for line in diff if line.startswith("+ ")];removed=[line[2:] for line in diff if line.startswith("- ")]
+        summary=[]
+        if added:summary.append(f"{len(added)} line(s) added.")
+        if removed:summary.append(f"{len(removed)} line(s) removed.")
+        if before.title!=after.title:summary.append("Title changed.")
+        deltas.append({"from_revision":before.revision_number,"to_revision":after.revision_number,"added":added,"removed":removed,"summary":summary,"at":after.edited_at.isoformat()})
+    updates=session.scalars(select(ThinkingUpdate).where(ThinkingUpdate.update_note_id==note.id,ThinkingUpdate.user_id==user.id).order_by(ThinkingUpdate.created_at)).all()
+    for update in updates:
+        summary=[]
+        if update.target_before is not None and update.target_after is not None:summary.append(f"Target changed from {float(update.target_before):g} to {float(update.target_after):g}.")
+        if update.confidence_before!=update.confidence_after and update.confidence_after:summary.append(f"Confidence changed from {update.confidence_before or 'unspecified'} to {update.confidence_after}.")
+        if update.thesis_state_before!=update.thesis_state_after and update.thesis_state_after:summary.append(f"Thesis state changed to {update.thesis_state_after}.")
+        deltas.append({"thinking_update_id":update.id,"summary":summary,"reason":update.change_reason,"at":update.created_at.isoformat()})
+    return deltas
+
 
 @app.put("/api/notes/{note_id}")
 async def edit_note(note_id: str, payload: EditNoteRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
@@ -294,6 +403,246 @@ async def edit_note(note_id: str, payload: EditNoteRequest, user: CurrentUser = 
     session.add(NoteRevision(note_id=note.id, user_id=user.id, revision_number=revision_number, title=note.title, body=note.body, type=note.type))
     session.commit()
     return serialized_note(session, note)
+
+
+RELATIONSHIP_TYPES = {"update_of", "updates", "supports", "contradicts", "answers", "derived_from", "supersedes", "related", "challenge_to", "converts_to"}
+
+def _owned_note(session, note_id, user_id):
+    note = session.scalar(select(Note).where(Note.id == note_id, Note.user_id == user_id))
+    if not note: raise HTTPException(404, "Note not found")
+    return note
+
+def _security_for_ticker(session, ticker):
+    return session.scalar(select(Security).where(Security.symbol == ticker.upper())) if ticker else None
+
+def _create_pending_questions(session, user_id, note, pending):
+    for item in pending:
+        text = (item.get("question") or "").strip()
+        if not text: continue
+        security = _security_for_ticker(session, item.get("ticker"))
+        session.add(ResearchQuestion(user_id=user_id, security_id=security.id if security else None, originating_note_id=note.id, thesis_note_id=note.id if note.type == "thesis" else None, question=text, priority=item.get("priority", "medium"), due_at=item.get("due_at")))
+
+@app.get("/api/notes/{note_id}/relationships")
+def note_relationships(note_id: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    note = _owned_note(session, note_id, user.id)
+    rows = session.scalars(select(NoteRelationship).where(or_(NoteRelationship.from_note_id == note.id, NoteRelationship.to_note_id == note.id)).order_by(NoteRelationship.created_at.desc())).all()
+    result=[]
+    for row in rows:
+        other_id = row.to_note_id if row.from_note_id == note.id else row.from_note_id
+        other = session.scalar(select(Note).where(Note.id == other_id, Note.user_id == user.id))
+        if other: result.append({"id":row.id,"direction":"outgoing" if row.from_note_id == note.id else "incoming","relationship_type":row.relationship_type,"explanation":row.explanation,"note":{"id":other.id,"title":other.title or other.body[:160],"type":other.type},"created_at":row.created_at.isoformat()})
+    return result
+
+@app.post("/api/notes/{note_id}/follow-ups")
+def add_follow_up(note_id: str, payload: FollowUpRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    parent = _owned_note(session, note_id, user.id)
+    if payload.relationship_type not in RELATIONSHIP_TYPES: raise HTTPException(422, "Invalid relationship type")
+    parsed = parse_note(payload.body, payload.note_type)
+    if parsed["errors"] or parsed["warnings"]: raise HTTPException(422, detail={"errors":parsed["errors"],"warnings":parsed["warnings"]})
+    # Follow-ups are notes, never implicit tracked calls; explicit call creation stays in its established workflow.
+    if parsed["tracked_calls"]: raise HTTPException(422, "Follow-ups cannot implicitly open tracked calls")
+    child = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published", quotes={})
+    session.add(NoteRelationship(user_id=user.id, from_note_id=child.id, to_note_id=parent.id, relationship_type=payload.relationship_type, explanation=payload.explanation, created_by_workflow="follow_up"))
+    _create_pending_questions(session, user.id, child, payload.pending_questions)
+    if payload.thinking_update:
+        data = payload.thinking_update
+        security = _security_for_ticker(session, data.get("ticker"))
+        session.add(ThinkingUpdate(user_id=user.id, security_id=security.id if security else None, update_note_id=child.id, prior_note_id=parent.id, change_direction=data.get("change_direction", "unchanged"), confidence_before=data.get("confidence_before"), confidence_after=data.get("confidence_after"), target_before=data.get("target_before"), target_after=data.get("target_after"), target_unit=data.get("target_unit"), horizon_before_days=data.get("horizon_before_days"), horizon_after_days=data.get("horizon_after_days"), change_reason=data.get("change_reason")))
+    session.commit(); return serialized_note(session, child)
+
+@app.post("/api/assumptions")
+def create_assumption(payload: LedgerRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    security=_security_for_ticker(session,payload.ticker)
+    if payload.note_id: _owned_note(session,payload.note_id,user.id)
+    status_value=payload.status or "untested"; importance=payload.importance or "medium"
+    if status_value not in {"untested","supported","challenged","confirmed","disproven","retired"} or importance not in {"low","medium","high","critical"}: raise HTTPException(422,"Invalid assumption state")
+    value=Assumption(user_id=user.id,security_id=security.id if security else None,originating_note_id=payload.note_id,statement=payload.statement,status=status_value,importance=importance)
+    session.add(value);session.flush();session.add(AssumptionEvent(assumption_id=value.id,user_id=user.id,event_type="created",to_value=status_value));session.commit();return {"id":value.id,"statement":value.statement,"status":value.status,"importance":value.importance}
+
+@app.get("/api/assumptions")
+def list_assumptions(ticker:str|None=None,status_value:str|None=None,limit:int=100,offset:int=0,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    q=select(Assumption).where(Assumption.user_id==user.id)
+    if ticker:
+        security=_security_for_ticker(session,ticker); q=q.where(Assumption.security_id==security.id) if security else q.where(False)
+    if status_value:q=q.where(Assumption.status==status_value)
+    rows=session.scalars(q.order_by(Assumption.updated_at.desc()).offset(max(offset,0)).limit(min(max(limit,1),200))).all()
+    return [{"id":x.id,"statement":x.statement,"status":x.status,"importance":x.importance,"security_id":x.security_id,"updated_at":x.updated_at.isoformat()} for x in rows]
+
+@app.post("/api/evidence")
+def create_evidence(payload: LedgerRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    security=_security_for_ticker(session,payload.ticker)
+    if payload.note_id:_owned_note(session,payload.note_id,user.id)
+    if payload.source_id and not session.scalar(select(Source).where(Source.id==payload.source_id,Source.user_id==user.id)):raise HTTPException(404,"Source not found")
+    direction=payload.direction or "contextual"; strength=payload.strength or "moderate"
+    if direction not in {"supports","contradicts","mixed","contextual"} or strength not in {"weak","moderate","strong"}:raise HTTPException(422,"Invalid evidence classification")
+    value=Evidence(user_id=user.id,security_id=security.id if security else None,originating_note_id=payload.note_id,source_id=payload.source_id,statement=payload.statement,evidence_direction=direction,strength=strength)
+    session.add(value);session.flush()
+    for aid in set(payload.assumption_ids):
+        if not session.scalar(select(Assumption).where(Assumption.id==aid,Assumption.user_id==user.id)):raise HTTPException(404,"Assumption not found")
+        session.add(EvidenceAssumption(evidence_id=value.id,assumption_id=aid))
+    for nid in set(payload.thesis_note_ids):
+        thesis=_owned_note(session,nid,user.id)
+        if thesis.type!="thesis":raise HTTPException(422,"Evidence thesis links require a thesis note")
+        session.add(EvidenceThesis(evidence_id=value.id,thesis_note_id=nid))
+    for fid in set(payload.forecast_ids):
+        if not session.scalar(select(Forecast).where(Forecast.id==fid,Forecast.user_id==user.id)):raise HTTPException(404,"Forecast not found")
+        session.add(EvidenceForecast(evidence_id=value.id,forecast_id=fid))
+    for qid in set(payload.question_ids):
+        if not session.scalar(select(ResearchQuestion).where(ResearchQuestion.id==qid,ResearchQuestion.user_id==user.id)):raise HTTPException(404,"Question not found")
+        session.add(EvidenceQuestion(evidence_id=value.id,question_id=qid))
+    session.commit();return {"id":value.id,"statement":value.statement,"direction":value.evidence_direction}
+
+@app.post("/api/questions")
+def create_question(payload:LedgerRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    security=_security_for_ticker(session,payload.ticker)
+    if payload.note_id:_owned_note(session,payload.note_id,user.id)
+    priority=payload.priority or "medium"
+    if priority not in {"low","medium","high","critical"}:raise HTTPException(422,"Invalid question priority")
+    value=ResearchQuestion(user_id=user.id,security_id=security.id if security else None,originating_note_id=payload.note_id,question=payload.statement,priority=priority,due_at=payload.due_at);session.add(value);session.commit();return {"id":value.id,"question":value.question,"status":value.status}
+
+@app.get("/api/questions")
+def research_queue(ticker:str|None=None,status_value:str|None=None,limit:int=100,offset:int=0,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    q=select(ResearchQuestion).where(ResearchQuestion.user_id==user.id)
+    if ticker:
+        security=_security_for_ticker(session,ticker);q=q.where(ResearchQuestion.security_id==security.id) if security else q.where(False)
+    if status_value:q=q.where(ResearchQuestion.status==status_value)
+    rows=session.scalars(q.order_by(ResearchQuestion.priority.desc(),ResearchQuestion.due_at.asc().nulls_last(),ResearchQuestion.created_at.asc()).offset(max(offset,0)).limit(min(max(limit,1),200))).all()
+    return [{"id":x.id,"question":x.question,"status":x.status,"priority":x.priority,"due_at":x.due_at.isoformat() if x.due_at else None,"security_id":x.security_id} for x in rows]
+
+@app.post("/api/forecasts")
+def create_forecast(payload:ForecastRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    security=_security_for_ticker(session,payload.ticker)
+    if payload.note_id:_owned_note(session,payload.note_id,user.id)
+    if payload.assumption_id and not session.scalar(select(Assumption).where(Assumption.id==payload.assumption_id,Assumption.user_id==user.id)):raise HTTPException(404,"Assumption not found")
+    if payload.forecast_type not in {"point","minimum","maximum","range","direction","event","probability"}:raise HTTPException(422,"Invalid forecast type")
+    if payload.target_period_end and payload.target_period_end < payload.target_period_start:raise HTTPException(422,"Forecast period end must follow start")
+    value=Forecast(user_id=user.id,security_id=security.id if security else None,originating_note_id=payload.note_id,assumption_id=payload.assumption_id,metric_name=payload.metric_name,forecast_type=payload.forecast_type,target_value=payload.target_value,lower_bound=payload.lower_bound,upper_bound=payload.upper_bound,value_unit=payload.value_unit,direction=payload.direction,probability=payload.probability,target_period_start=payload.target_period_start,target_period_end=payload.target_period_end);session.add(value);session.commit();return {"id":value.id,"metric_name":value.metric_name,"status":value.status}
+
+@app.post("/api/forecasts/{forecast_id}/resolve")
+def resolve_forecast(forecast_id:str,payload:ForecastResolutionRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    value=session.scalar(select(Forecast).where(Forecast.id==forecast_id,Forecast.user_id==user.id))
+    if not value:raise HTTPException(404,"Forecast not found")
+    if value.status!="open":raise HTTPException(409,"Forecast is already resolved")
+    if payload.outcome not in {"correct","partially_correct","incorrect","unresolvable"}:raise HTTPException(422,"Invalid forecast outcome")
+    if payload.resolution_source_id and not session.scalar(select(Source).where(Source.id==payload.resolution_source_id,Source.user_id==user.id)):raise HTTPException(404,"Source not found")
+    value.status="resolved";value.outcome=payload.outcome;value.resolution_value=payload.resolution_value;value.resolution_source_id=payload.resolution_source_id;value.resolution_note=payload.resolution_note;value.resolved_at=datetime.now(timezone.utc)
+    if value.target_value is not None and payload.resolution_value is not None:
+        value.error_value=float(payload.resolution_value)-float(value.target_value);value.error_percentage=value.error_value/abs(float(value.target_value)) if value.target_value else None
+    session.add(ForecastEvent(forecast_id=value.id,user_id=user.id,event_type="resolved",snapshot_json={"resolution_value":payload.resolution_value,"outcome":payload.outcome,"error_value":float(value.error_value) if value.error_value is not None else None},explanation=payload.resolution_note))
+    session.commit();return {"id":value.id,"status":value.status,"outcome":value.outcome,"error_value":float(value.error_value) if value.error_value is not None else None}
+
+@app.patch("/api/assumptions/{assumption_id}")
+def update_assumption(assumption_id:str,payload:UpdateAssumptionRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    value=session.scalar(select(Assumption).where(Assumption.id==assumption_id,Assumption.user_id==user.id))
+    if not value: raise HTTPException(404,"Assumption not found")
+    previous={"status":value.status,"importance":value.importance,"current_value":value.current_value}
+    if payload.status is not None:
+        if payload.status not in {"untested","supported","challenged","confirmed","disproven","retired"}:raise HTTPException(422,"Invalid assumption state")
+        value.status=payload.status
+        if payload.status in {"confirmed","disproven","retired"}:value.resolved_at=datetime.now(timezone.utc)
+    if payload.importance is not None:
+        if payload.importance not in {"low","medium","high","critical"}:raise HTTPException(422,"Invalid importance")
+        value.importance=payload.importance
+    if payload.current_value is not None:value.current_value=payload.current_value
+    for field,old in previous.items():
+        new=getattr(value,field)
+        if old!=new:session.add(AssumptionEvent(assumption_id=value.id,user_id=user.id,event_type=field+"_changed",from_value=str(old) if old is not None else None,to_value=str(new) if new is not None else None,explanation=payload.explanation))
+    session.commit();return {"id":value.id,"status":value.status,"importance":value.importance,"current_value":value.current_value}
+
+@app.get("/api/assumptions/{assumption_id}/events")
+def assumption_events(assumption_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    value=session.scalar(select(Assumption).where(Assumption.id==assumption_id,Assumption.user_id==user.id))
+    if not value:raise HTTPException(404,"Assumption not found")
+    rows=session.scalars(select(AssumptionEvent).where(AssumptionEvent.assumption_id==value.id,AssumptionEvent.user_id==user.id).order_by(AssumptionEvent.created_at.desc())).all()
+    return [{"type":x.event_type,"from":x.from_value,"to":x.to_value,"explanation":x.explanation,"at":x.created_at.isoformat()} for x in rows]
+
+@app.post("/api/questions/{question_id}/answer")
+def answer_question(question_id:str,payload:AnswerQuestionRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    value=session.scalar(select(ResearchQuestion).where(ResearchQuestion.id==question_id,ResearchQuestion.user_id==user.id))
+    if not value:raise HTTPException(404,"Question not found")
+    if payload.status not in {"open","partially_answered","answered","no_longer_relevant"}:raise HTTPException(422,"Invalid question state")
+    if payload.answered_by_note_id:_owned_note(session,payload.answered_by_note_id,user.id)
+    if payload.answered_by_source_id and not session.scalar(select(Source).where(Source.id==payload.answered_by_source_id,Source.user_id==user.id)):raise HTTPException(404,"Source not found")
+    old=value.status;value.status=payload.status;value.answer_summary=payload.answer_summary;value.answered_by_note_id=payload.answered_by_note_id;value.answered_by_source_id=payload.answered_by_source_id
+    if payload.status in {"answered","no_longer_relevant"}:value.resolved_at=datetime.now(timezone.utc)
+    session.add(QuestionEvent(question_id=value.id,user_id=user.id,event_type="status_changed",from_value=old,to_value=value.status,explanation=payload.answer_summary));session.commit();return {"id":value.id,"status":value.status}
+
+@app.get("/api/questions/{question_id}/events")
+def question_events(question_id:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    value=session.scalar(select(ResearchQuestion).where(ResearchQuestion.id==question_id,ResearchQuestion.user_id==user.id))
+    if not value:raise HTTPException(404,"Question not found")
+    rows=session.scalars(select(QuestionEvent).where(QuestionEvent.question_id==value.id,QuestionEvent.user_id==user.id).order_by(QuestionEvent.created_at.desc())).all()
+    return [{"type":x.event_type,"from":x.from_value,"to":x.to_value,"explanation":x.explanation,"at":x.created_at.isoformat()} for x in rows]
+
+@app.post("/api/notes/{note_id}/convert")
+def convert_note(note_id:str,payload:ConvertRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    source=_owned_note(session,note_id,user.id); target=payload.target_type
+    if target not in {"question","evidence","assumption","idea","thesis"}:raise HTTPException(422,"Invalid conversion target")
+    tickers=session.scalars(select(Security.symbol).join(NoteSecurityMention,NoteSecurityMention.security_id==Security.id).where(NoteSecurityMention.note_id==source.id)).all(); ticker=payload.ticker or (tickers[0] if tickers else None)
+    if target in {"idea","thesis"}:
+        parsed=parse_note(payload.body or source.body,target)
+        if parsed["errors"] or parsed["tracked_calls"]:raise HTTPException(422,"Conversion cannot create a tracked call")
+        created=create_note(session,user_id=user.id,parsed=parsed,title=payload.title or source.title or "",status="published",quotes={})
+        session.add(NoteRelationship(user_id=user.id,from_note_id=source.id,to_note_id=created.id,relationship_type="converts_to",created_by_workflow="conversion"));session.commit();return {"kind":"note","note":serialized_note(session,created)}
+    statement=payload.statement or payload.body or source.body
+    parsed=parse_note(("$"+ticker+" " if ticker else "")+statement,target)
+    created_note=create_note(session,user_id=user.id,parsed=parsed,title=payload.title or source.title or "",status="published",quotes={})
+    security=_security_for_ticker(session,ticker)
+    if target=="question":
+        created=ResearchQuestion(user_id=user.id,security_id=security.id if security else None,originating_note_id=created_note.id,question=statement,priority=payload.priority)
+    elif target=="evidence":created=Evidence(user_id=user.id,security_id=security.id if security else None,originating_note_id=created_note.id,statement=statement,evidence_direction="contextual")
+    else:created=Assumption(user_id=user.id,security_id=security.id if security else None,originating_note_id=created_note.id,statement=statement)
+    session.add(created);session.add(NoteRelationship(user_id=user.id,from_note_id=created_note.id,to_note_id=source.id,relationship_type="converts_to",created_by_workflow="conversion"))
+    session.commit();return {"kind":target,"id":created.id,"note":serialized_note(session,created_note)}
+
+@app.post("/api/notes/{note_id}/challenge")
+def challenge_thesis(note_id:str,payload:ChallengeRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    thesis=_owned_note(session,note_id,user.id)
+    if thesis.type!="thesis":raise HTTPException(422,"Only thesis notes can be challenged")
+    prompts=[("Opposing case",payload.opposing_case),("Least defensible assumption",payload.weakest_assumption),("Discounted evidence",payload.discounted_evidence),("What the market may understand",payload.market_knows),("If the catalyst takes twice as long",payload.delayed_catalyst),("Fundamentals right, stock wrong",payload.fundamental_vs_stock)]
+    body="\n\n".join(f"{label}: {value}" for label,value in prompts if value and value.strip())
+    if not body:raise HTTPException(422,"Add at least one challenge prompt")
+    tickers=session.scalars(select(Security.symbol).join(NoteSecurityMention,NoteSecurityMention.security_id==Security.id).where(NoteSecurityMention.note_id==thesis.id)).all()
+    prefix="$"+(payload.ticker or (tickers[0] if tickers else "")) if payload.ticker or tickers else ""
+    parsed=parse_note((prefix+" "+body).strip(),"challenge")
+    note=create_note(session,user_id=user.id,parsed=parsed,title=payload.title,status="published",quotes={})
+    session.add(NoteRelationship(user_id=user.id,from_note_id=note.id,to_note_id=thesis.id,relationship_type="challenge_to",created_by_workflow="challenge"))
+    for aid in set(payload.assumption_ids):
+        assumption=session.scalar(select(Assumption).where(Assumption.id==aid,Assumption.user_id==user.id))
+        if not assumption:raise HTTPException(404,"Assumption not found")
+        session.add(AssumptionEvent(assumption_id=aid,user_id=user.id,event_type="challenged_by_note",to_value=note.id,explanation=payload.weakest_assumption))
+    for eid in set(payload.evidence_ids):
+        if not session.scalar(select(Evidence).where(Evidence.id==eid,Evidence.user_id==user.id)):raise HTTPException(404,"Evidence not found")
+        session.add(EvidenceThesis(evidence_id=eid,thesis_note_id=thesis.id))
+    session.commit();return serialized_note(session,note)
+
+@app.post("/api/saved-views")
+def save_view(payload:SavedViewRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    value=SavedView(user_id=user.id,name=payload.name,resource=payload.resource,filters_json=payload.filters);session.add(value)
+    try:session.commit()
+    except Exception:
+        session.rollback();raise HTTPException(409,"A saved view with that name already exists")
+    return {"id":value.id,"name":value.name,"resource":value.resource,"filters":value.filters_json}
+
+@app.get("/api/saved-views")
+def saved_views(resource:str|None=None,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    q=select(SavedView).where(SavedView.user_id==user.id)
+    if resource:q=q.where(SavedView.resource==resource)
+    rows=session.scalars(q.order_by(SavedView.updated_at.desc())).all()
+    return [{"id":x.id,"name":x.name,"resource":x.resource,"filters":x.filters_json} for x in rows]
+
+@app.get("/api/research-reviews/{period}")
+def research_review(period:str,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
+    if period not in {"daily","weekly"}:raise HTTPException(422,"Period must be daily or weekly")
+    now=datetime.now(timezone.utc); days=1 if period=="daily" else 7
+    since=now.replace(hour=0,minute=0,second=0,microsecond=0)
+    from datetime import timedelta
+    since-=timedelta(days=days-1)
+    notes=session.scalars(select(Note).where(Note.user_id==user.id,Note.created_at>=since).order_by(Note.created_at.desc())).all()
+    updates=session.scalars(select(ThinkingUpdate).where(ThinkingUpdate.user_id==user.id,ThinkingUpdate.created_at>=since).order_by(ThinkingUpdate.created_at.desc())).all()
+    questions=session.scalars(select(ResearchQuestion).where(ResearchQuestion.user_id==user.id,ResearchQuestion.status.in_(("open","partially_answered"))).order_by(ResearchQuestion.priority.desc()).limit(10)).all()
+    forecasts=session.scalars(select(Forecast).where(Forecast.user_id==user.id,Forecast.status=="resolved",Forecast.resolved_at>=since)).all()
+    return {"period":period,"from":since.isoformat(),"to":now.isoformat(),"new_notes":len(notes),"thinking_updates":[{"id":x.id,"direction":x.change_direction,"reason":x.change_reason,"at":x.created_at.isoformat()} for x in updates],"open_questions":[{"id":x.id,"question":x.question,"priority":x.priority} for x in questions],"resolved_forecasts":[{"id":x.id,"metric":x.metric_name,"outcome":x.outcome} for x in forecasts]}
 
 
 @app.get("/api/calls")
@@ -469,7 +818,12 @@ async def ticker_detail(symbol: str, user: CurrentUser = Depends(get_current_use
     calls = session.scalars(select(TrackedCall).join(TrackedCallLeg, TrackedCallLeg.tracked_call_id == TrackedCall.id).where(TrackedCall.user_id == user.id, TrackedCallLeg.security_id == security.id).order_by(TrackedCall.opened_at.desc())).all()
     quote = session.scalar(select(SecurityPrice).where(SecurityPrice.security_id == security.id).order_by(SecurityPrice.timestamp.desc()).limit(1))
     events = session.scalars(select(CallEvent).join(TrackedCall, TrackedCall.id == CallEvent.tracked_call_id).join(TrackedCallLeg, TrackedCallLeg.tracked_call_id == TrackedCall.id).where(TrackedCall.user_id == user.id, TrackedCallLeg.security_id == security.id).order_by(CallEvent.occurred_at.desc())).all()
-    return {"symbol": security.symbol, "company_name": security.company_name, "quote": {"price": float(quote.raw_price), "timestamp": quote.timestamp.isoformat(), "basis": quote.price_type} if quote else None, "notes": [serialized_note(session, note) for note in notes], "calls": [{"call": serialize_call(session, call), "returns": call_return_object(session, call)} for call in calls], "timeline": [{"type": event.event_type, "occurred_at": event.occurred_at.isoformat(), "explanation": event.explanation, "call_id": event.tracked_call_id} for event in events]}
+    assumptions=session.scalars(select(Assumption).where(Assumption.user_id==user.id,Assumption.security_id==security.id).order_by(Assumption.updated_at.desc())).all()
+    evidence=session.scalars(select(Evidence).where(Evidence.user_id==user.id,Evidence.security_id==security.id,Evidence.status=="active").order_by(Evidence.created_at.desc())).all()
+    questions=session.scalars(select(ResearchQuestion).where(ResearchQuestion.user_id==user.id,ResearchQuestion.security_id==security.id,ResearchQuestion.status.in_(("open","partially_answered"))).order_by(ResearchQuestion.priority.desc())).all()
+    forecasts=session.scalars(select(Forecast).where(Forecast.user_id==user.id,Forecast.security_id==security.id).order_by(Forecast.created_at.desc())).all()
+    updates=session.scalars(select(ThinkingUpdate).where(ThinkingUpdate.user_id==user.id,ThinkingUpdate.security_id==security.id).order_by(ThinkingUpdate.created_at.desc())).all()
+    return {"symbol": security.symbol, "company_name": security.company_name, "quote": {"price": float(quote.raw_price), "timestamp": quote.timestamp.isoformat(), "basis": quote.price_type} if quote else None, "notes": [serialized_note(session, note) for note in notes], "calls": [{"call": serialize_call(session, call), "returns": call_return_object(session, call)} for call in calls], "timeline": [{"type": event.event_type, "occurred_at": event.occurred_at.isoformat(), "explanation": event.explanation, "call_id": event.tracked_call_id} for event in events], "workspace":{"open_question_count":len(questions),"active_assumption_count":len([x for x in assumptions if x.status not in {"disproven","retired"}]),"last_substantive_update":updates[0].created_at.isoformat() if updates else None,"assumptions":[{"id":x.id,"statement":x.statement,"status":x.status,"importance":x.importance,"updated_at":x.updated_at.isoformat()} for x in assumptions],"evidence":[{"id":x.id,"statement":x.statement,"direction":x.evidence_direction,"strength":x.strength} for x in evidence],"questions":[{"id":x.id,"question":x.question,"priority":x.priority,"status":x.status} for x in questions],"forecasts":[{"id":x.id,"metric_name":x.metric_name,"status":x.status,"target_value":float(x.target_value) if x.target_value is not None else None,"value_unit":x.value_unit} for x in forecasts]}}
 
 
 @app.post("/api/notes/import-legacy")
@@ -510,6 +864,7 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
         raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
     note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published", quotes=quotes)
     save_thesis_details(session, note.id, payload.thesis_details)
+    _create_pending_questions(session, user.id, note, payload.pending_questions)
     session.commit()
     log_event("note_published", user_id=user.id, note_id=note.id, call_count=len(parsed["tracked_calls"]))
     return serialized_note(session, note)

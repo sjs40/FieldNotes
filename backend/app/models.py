@@ -1,6 +1,6 @@
 from datetime import datetime
 from uuid import uuid4
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
@@ -181,7 +181,192 @@ class NoteRelationship(Base):
     from_note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"), index=True)
     to_note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"), index=True)
     relationship_type: Mapped[str] = mapped_column(String(32), default="update_of")
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_workflow: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("from_note_id", "to_note_id", "relationship_type", name="uq_note_relationship"), CheckConstraint("from_note_id <> to_note_id", name="ck_note_relationship_not_self"))
+
+
+# The reasoning ledger is deliberately normalized: these records are queried by
+# ticker, thesis and status and must not be hidden in note metadata.
+class ThinkingUpdate(Base):
+    __tablename__ = "thinking_updates"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    security_id: Mapped[str | None] = mapped_column(ForeignKey("securities.id"), nullable=True, index=True)
+    update_note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"), index=True)
+    prior_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    tracked_call_id: Mapped[str | None] = mapped_column(ForeignKey("tracked_calls.id"), nullable=True)
+    change_direction: Mapped[str] = mapped_column(String(16), default="unchanged")
+    confidence_before: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    confidence_after: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    thesis_state_before: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    thesis_state_after: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    target_before: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    target_after: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    target_unit: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    horizon_before_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    horizon_after_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    change_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class Assumption(Base):
+    __tablename__ = "assumptions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    security_id: Mapped[str | None] = mapped_column(ForeignKey("securities.id"), nullable=True, index=True)
+    thesis_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    originating_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    statement: Mapped[str] = mapped_column(Text)
+    category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="untested", index=True)
+    importance: Mapped[str] = mapped_column(String(16), default="medium")
+    current_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    value_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    expected_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    expected_period: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AssumptionEvent(Base):
+    __tablename__ = "assumption_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    assumption_id: Mapped[str] = mapped_column(ForeignKey("assumptions.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))
+    from_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    to_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class Evidence(Base):
+    __tablename__ = "evidence"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    security_id: Mapped[str | None] = mapped_column(ForeignKey("securities.id"), nullable=True, index=True)
+    originating_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id"), nullable=True)
+    source_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    statement: Mapped[str] = mapped_column(Text)
+    evidence_direction: Mapped[str] = mapped_column(String(16), default="contextual")
+    strength: Mapped[str] = mapped_column(String(16), default="moderate")
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reliability: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    commentary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class EvidenceAssumption(Base):
+    __tablename__ = "evidence_assumptions"
+    evidence_id: Mapped[str] = mapped_column(ForeignKey("evidence.id"), primary_key=True)
+    assumption_id: Mapped[str] = mapped_column(ForeignKey("assumptions.id"), primary_key=True)
+
+class EvidenceThesis(Base):
+    __tablename__ = "evidence_theses"
+    evidence_id: Mapped[str] = mapped_column(ForeignKey("evidence.id"), primary_key=True)
+    thesis_note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"), primary_key=True)
+
+class EvidenceForecast(Base):
+    __tablename__ = "evidence_forecasts"
+    evidence_id: Mapped[str] = mapped_column(ForeignKey("evidence.id"), primary_key=True)
+    forecast_id: Mapped[str] = mapped_column(ForeignKey("forecasts.id"), primary_key=True)
+
+class EvidenceQuestion(Base):
+    __tablename__ = "evidence_questions"
+    evidence_id: Mapped[str] = mapped_column(ForeignKey("evidence.id"), primary_key=True)
+    question_id: Mapped[str] = mapped_column(ForeignKey("research_questions.id"), primary_key=True)
+
+
+class ResearchQuestion(Base):
+    __tablename__ = "research_questions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    security_id: Mapped[str | None] = mapped_column(ForeignKey("securities.id"), nullable=True, index=True)
+    originating_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    thesis_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    assumption_id: Mapped[str | None] = mapped_column(ForeignKey("assumptions.id"), nullable=True)
+    question: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="open", index=True)
+    priority: Mapped[str] = mapped_column(String(16), default="medium")
+    answer_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answered_by_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    answered_by_source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id"), nullable=True)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class QuestionEvent(Base):
+    __tablename__ = "question_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    question_id: Mapped[str] = mapped_column(ForeignKey("research_questions.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))
+    from_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    to_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class Forecast(Base):
+    __tablename__ = "forecasts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    security_id: Mapped[str | None] = mapped_column(ForeignKey("securities.id"), nullable=True, index=True)
+    originating_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    thesis_note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    assumption_id: Mapped[str | None] = mapped_column(ForeignKey("assumptions.id"), nullable=True)
+    metric_name: Mapped[str] = mapped_column(String(255))
+    metric_definition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    forecast_type: Mapped[str] = mapped_column(String(16), default="point")
+    target_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    lower_bound: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    upper_bound: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    value_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    probability: Mapped[float | None] = mapped_column(Numeric(6, 5), nullable=True)
+    target_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    target_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    resolution_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    resolution_source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id"), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    error_percentage: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class ForecastEvent(Base):
+    __tablename__ = "forecast_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    forecast_id: Mapped[str] = mapped_column(ForeignKey("forecasts.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(32))
+    snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+class SavedView(Base):
+    __tablename__ = "saved_views"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    resource: Mapped[str] = mapped_column(String(32))
+    filters_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "resource", "name", name="uq_saved_view_name"),)
 
 
 class ThesisDetails(Base):

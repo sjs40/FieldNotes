@@ -2,7 +2,7 @@
 from collections import defaultdict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from .models import CallEvent, Note, NoteRevision, NoteSecurityMention, PortfolioPosition, Security, ThesisReview, TrackedCall, TrackedCallLeg
+from .models import Assumption, CallEvent, Evidence, Forecast, Note, NoteRelationship, NoteRevision, NoteSecurityMention, PortfolioPosition, ResearchQuestion, Security, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg
 
 def ticker_timeline(session: Session, user_id: str, symbol: str, kind="all", order="desc"):
     security = session.scalar(select(Security).where(Security.symbol == symbol.upper()))
@@ -12,6 +12,18 @@ def ticker_timeline(session: Session, user_id: str, symbol: str, kind="all", ord
     for note in notes:
         events.append({"type":"note_published", "category":"thinking", "at":note.published_at or note.created_at, "note_id":note.id, "excerpt":note.title or note.body[:160], "note_type":note.type})
         for revision in session.scalars(select(NoteRevision).where(NoteRevision.note_id==note.id, NoteRevision.revision_number>1)).all(): events.append({"type":"note_revised", "category":"thinking", "at":revision.edited_at, "note_id":note.id, "excerpt":revision.title or revision.body[:160]})
+        for relation in session.scalars(select(NoteRelationship).where(NoteRelationship.from_note_id==note.id)).all():
+            events.append({"type":"relationship_"+relation.relationship_type,"category":"thinking","at":relation.created_at,"note_id":note.id,"related_note_id":relation.to_note_id,"excerpt":relation.explanation})
+    for update in session.scalars(select(ThinkingUpdate).where(ThinkingUpdate.user_id==user_id,ThinkingUpdate.security_id==security.id)).all():
+        events.append({"type":"thinking_update","category":"thinking","at":update.created_at,"note_id":update.update_note_id,"excerpt":update.change_reason,"change_direction":update.change_direction})
+    for value in session.scalars(select(Assumption).where(Assumption.user_id==user_id,Assumption.security_id==security.id)).all():
+        events.append({"type":"assumption_"+value.status,"category":"assumptions","at":value.updated_at,"assumption_id":value.id,"excerpt":value.statement,"importance":value.importance})
+    for value in session.scalars(select(Evidence).where(Evidence.user_id==user_id,Evidence.security_id==security.id)).all():
+        events.append({"type":"evidence_"+value.evidence_direction,"category":"evidence","at":value.created_at,"evidence_id":value.id,"excerpt":value.statement,"strength":value.strength,"source_id":value.source_id})
+    for value in session.scalars(select(ResearchQuestion).where(ResearchQuestion.user_id==user_id,ResearchQuestion.security_id==security.id)).all():
+        events.append({"type":"question_"+value.status,"category":"questions","at":value.resolved_at or value.created_at,"question_id":value.id,"excerpt":value.question,"priority":value.priority})
+    for value in session.scalars(select(Forecast).where(Forecast.user_id==user_id,Forecast.security_id==security.id)).all():
+        events.append({"type":"forecast_"+value.status,"category":"forecasts","at":value.resolved_at or value.created_at,"forecast_id":value.id,"excerpt":value.metric_name,"outcome":value.outcome})
     calls=session.scalars(select(TrackedCall).join(TrackedCallLeg).where(TrackedCall.user_id==user_id, TrackedCallLeg.security_id==security.id)).all()
     for call in calls:
         for event in session.scalars(select(CallEvent).where(CallEvent.tracked_call_id==call.id)).all(): events.append({"type":"call_"+event.event_type, "category":"calls", "at":event.occurred_at, "call_id":call.id, "excerpt":event.explanation, "snapshot":event.snapshot_json})
