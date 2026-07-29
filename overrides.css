@@ -14,3 +14,32 @@
 .thesis-details label { display: block; margin-top: 9px; font-size: 13px; }
 .thesis-details input, .thesis-details textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px; border: 1px solid #d9d7d0; border-radius: 4px; font: inherit; }
 .thesis-details textarea { min-height: 52px; }
+
+/* Capture-first home */
+.capture-home { max-width: 920px; }
+.capture-composer { padding: 24px; margin-bottom: 12px; }
+.capture-kicker { display: flex; justify-content: space-between; gap: 16px; color: var(--green); font: 600 12px 'DM Mono'; letter-spacing: .25px; }
+.capture-kicker span { color: var(--muted); font-weight: 400; text-align: right; }
+.capture-composer textarea { min-height: 190px; padding: 22px 0 14px; font: 400 23px/1.45 Fraunces, serif; }
+.capture-meta { display: flex; align-items: center; gap: 12px; border-top: 1px solid #edede7; padding: 12px 0 0; }
+.capture-meta .syntax-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shortcut-hint { color: var(--muted); font: 10px 'DM Mono'; margin-right: 9px; }
+.recent-captures { margin-top: 18px; }
+.recent-captures .section-head { margin-top: 0; }
+.recent-capture { padding: 12px 15px; }
+.recent-capture h3 { margin-bottom: 0; }
+.recent-capture .chips { margin-top: 6px; }
+.floating-capture { width: 100%; border: 0; border-radius: 7px; padding: 10px; margin-bottom: 14px; background: #273b31; color: #fff; font-weight: 700; text-align: left; }
+.floating-capture kbd { float: right; border: 1px solid #ffffff66; border-radius: 4px; padding: 1px 4px; font: 10px 'DM Mono'; }
+.mobile-floating-capture { display: none; }
+.all-page > section .section-head { margin-top: 31px; }
+
+@media (max-width: 850px) {
+  .capture-composer { padding: 18px; }
+  .capture-composer textarea { min-height: 155px; font-size: 20px; }
+  .capture-kicker span, .shortcut-hint { display: none; }
+  .capture-meta { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .capture-meta .syntax-hint { white-space: normal; }
+  .sidebar .floating-capture { display: none; }
+  .mobile-floating-capture { display: grid; place-items: center; position: fixed; right: 16px; bottom: 84px; z-index: 21; width: 48px; height: 48px; margin: 0; border-radius: 50%; padding: 0; font-size: 28px; box-shadow: 0 6px 20px #0003; }
+}

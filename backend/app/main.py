@@ -1050,21 +1050,22 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
     parsed = parse_note(payload.body, payload.note_type)
     if parsed["errors"] or parsed["warnings"]:
         raise HTTPException(status_code=422, detail={"errors": parsed["errors"], "warnings": parsed["warnings"]})
-    provider = YFinanceMarketDataProvider()
-    quote_failures = {}
-    symbols = {"SPY"}
-    for call in parsed["tracked_calls"]:
-        symbols.update([call.get("symbol"), call.get("long"), call.get("short")])
-    symbols.discard(None)
     quotes = {}
-    for symbol in symbols:
-        try:
-            quote = provider.get_latest_quote(symbol)
-            quotes[symbol] = quote
-        except Exception as exc:
-            quote_failures[symbol] = str(exc)
-    if parsed["tracked_calls"] and quote_failures:
-        raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
+    if parsed["tracked_calls"]:
+        provider = YFinanceMarketDataProvider()
+        quote_failures = {}
+        symbols = {"SPY"}
+        for call in parsed["tracked_calls"]:
+            symbols.update([call.get("symbol"), call.get("long"), call.get("short")])
+        symbols.discard(None)
+        for symbol in symbols:
+            try:
+                quote = provider.get_latest_quote(symbol)
+                quotes[symbol] = quote
+            except Exception as exc:
+                quote_failures[symbol] = str(exc)
+        if quote_failures:
+            raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
     note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published", quotes=quotes)
     link_note_source_url(session, user.id, note, payload.source_url)
     save_thesis_details(session, note.id, payload.thesis_details)

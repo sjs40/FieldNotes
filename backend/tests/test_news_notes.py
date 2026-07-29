@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -54,10 +55,17 @@ class NewsNoteTests(unittest.TestCase):
         invalid = self.client.post("/api/notes", json={"note_type": "news", "body": "Bad link.", "source_url": "example.com"})
         self.assertEqual(invalid.status_code, 422)
 
-    def test_news_shortcut_is_parsed(self):
-        parsed = parse_note("/news Major development", "note")
-        self.assertEqual(parsed["note_type"], "news")
-        self.assertEqual(parsed["clean_body"], "Major development")
+    def test_human_friendly_type_shortcuts_are_parsed(self):
+        for shortcut, note_type in [("/news", "news"), ("/idea", "idea"), ("/obs", "observation"), ("/th", "thesis")]:
+            parsed = parse_note(f"{shortcut} Major development", "note")
+            self.assertEqual(parsed["note_type"], note_type)
+            self.assertEqual(parsed["clean_body"], "Major development")
+
+    @patch("backend.app.main.YFinanceMarketDataProvider")
+    def test_plain_capture_publishes_without_market_data(self, provider_class):
+        response = self.client.post("/api/notes/publish", json={"note_type": "news", "body": "A headline worth saving."})
+        self.assertEqual(response.status_code, 200)
+        provider_class.assert_not_called()
 
 
 if __name__ == "__main__":
