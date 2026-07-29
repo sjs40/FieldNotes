@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/index.py": {
-      "includeFiles": "{backend/**,index.html,app-modern.js,auth-client.js,api-bridge.js,refresh-prices.js,styles.css,overrides.css,manifest.webmanifest,sw.js}"
+      "includeFiles": "{backend/**,index.html,app-modern.js,fieldnotes-markdown.js,auth-client.js,api-bridge.js,refresh-prices.js,styles.css,overrides.css,manifest.webmanifest,sw.js}"
     }
   },
   "rewrites": [

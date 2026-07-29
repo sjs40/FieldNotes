@@ -75,6 +75,12 @@ class NewsNoteTests(unittest.TestCase):
         self.assertEqual(response.json()["type"], "idea")
         self.assertEqual(response.json()["title"], "A clean title")
 
+    def test_markdown_capture_is_preserved_as_raw_note_text(self):
+        body = "# Research update\n\n- **Catalyst:** stronger demand\n- [ ] Revisit guidance"
+        response = self.client.post("/api/notes", json={"body": body})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["body"], body)
+
 
 if __name__ == "__main__":
     unittest.main()
