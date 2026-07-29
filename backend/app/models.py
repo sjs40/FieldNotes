@@ -40,6 +40,27 @@ class Security(Base):
     active: Mapped[bool] = mapped_column(default=True)
 
 
+class CompanyWorkspace(Base):
+    """An analyst-owned research workspace layered over the global security master."""
+    __tablename__ = "company_workspaces"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    security_id: Mapped[str] = mapped_column(ForeignKey("securities.id"), index=True)
+    company_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    business_model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_followed: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "security_id", name="uq_company_workspace_user_security"),)
+
+
+class UserWorkspacePreference(Base):
+    __tablename__ = "user_workspace_preferences"
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    active_security_id: Mapped[str | None] = mapped_column(ForeignKey("securities.id"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SecurityPrice(Base):
     __tablename__ = "security_prices"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)

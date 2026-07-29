@@ -10,7 +10,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, Idea, IdeaSecurity, InboxItem, MetricCard, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings, WeeklyReview
+from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, CompanyWorkspace, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, Idea, IdeaSecurity, InboxItem, MetricCard, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings, UserWorkspacePreference, WeeklyReview
 from .parser import capture_title, parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -42,6 +42,7 @@ class PublishRequest(BaseModel):
     note_type: str = "note"
     title: str = ""
     source_url: str | None = None
+    active_ticker: str | None = Field(default=None, max_length=32)
     thesis_details: dict | None = None
     pending_questions: list[dict] = []
 
@@ -50,6 +51,21 @@ class EditNoteRequest(BaseModel):
     body: str
     note_type: str = "note"
     title: str = ""
+
+
+class CompanyWorkspaceRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=32)
+    company_name: str | None = Field(default=None, max_length=255)
+    company_description: str | None = Field(default=None, max_length=20000)
+    business_model: str | None = Field(default=None, max_length=20000)
+    is_followed: bool = True
+
+
+class CompanyWorkspaceUpdateRequest(BaseModel):
+    company_name: str | None = Field(default=None, max_length=255)
+    company_description: str | None = Field(default=None, max_length=20000)
+    business_model: str | None = Field(default=None, max_length=20000)
+    is_followed: bool | None = None
 
 class FollowUpRequest(PublishRequest):
     relationship_type: str = "updates"
@@ -267,6 +283,37 @@ def link_note_source_url(session: Session, user_id: str, note: Note, source_url:
         session.add(NoteSource(note_id=note.id, source_id=source.id, relationship_type="references"))
 
 
+def _company_workspace(session: Session, user_id: str, symbol: str, *, create: bool = False) -> tuple[CompanyWorkspace | None, Security | None]:
+    security = session.scalar(select(Security).where(Security.symbol == symbol.upper()))
+    if security is None and create:
+        security = Security(symbol=symbol.upper())
+        session.add(security)
+        session.flush()
+    if security is None:
+        return None, None
+    workspace = session.scalar(select(CompanyWorkspace).where(CompanyWorkspace.user_id == user_id, CompanyWorkspace.security_id == security.id))
+    if workspace is None and create:
+        workspace = CompanyWorkspace(user_id=user_id, security_id=security.id)
+        session.add(workspace)
+        session.flush()
+    return workspace, security
+
+
+def _workspace_payload(session: Session, workspace: CompanyWorkspace, security: Security, active_security_id: str | None = None) -> dict:
+    note_count = session.scalar(select(func.count(NoteSecurityMention.note_id)).join(Note, Note.id == NoteSecurityMention.note_id).where(Note.user_id == workspace.user_id, NoteSecurityMention.security_id == security.id)) or 0
+    return {"symbol": security.symbol, "company_name": security.company_name, "company_description": workspace.company_description, "business_model": workspace.business_model, "is_followed": workspace.is_followed, "is_active": security.id == active_security_id, "note_count": note_count, "updated_at": workspace.updated_at.isoformat() if workspace.updated_at else None}
+
+
+def _scope_parsed_to_active_company(session: Session, user_id: str, parsed: dict, active_ticker: str | None) -> dict:
+    """Apply UI company context only when the capture contains no explicit ticker."""
+    if not active_ticker or parsed["ticker_mentions"]:
+        return parsed
+    workspace, security = _company_workspace(session, user_id, active_ticker)
+    if workspace is None or security is None:
+        raise HTTPException(status_code=422, detail="Choose a company workspace before using it for capture context")
+    return {**parsed, "ticker_mentions": [security.symbol]}
+
+
 def record_frontend_note(session: Session, incoming: dict) -> Note:
     note = session.get(Note, str(incoming.get("id"))) if incoming.get("id") else None
     parsed = parse_note(incoming.get("body", ""), incoming.get("type", "note"))
@@ -381,7 +428,8 @@ async def create_draft(payload: PublishRequest, user: CurrentUser = Depends(get_
     parsed = parse_note(payload.body, payload.note_type)
     if parsed["errors"]:
         raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
-    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title or capture_title(parsed), status="draft")
+    parsed = _scope_parsed_to_active_company(session, user.id, parsed, payload.active_ticker)
+    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title or capture_title(payload.body, parsed), status="draft")
     link_note_source_url(session, user.id, note, payload.source_url)
     save_thesis_details(session, note.id, payload.thesis_details)
     _create_pending_questions(session, user.id, note, payload.pending_questions)
@@ -1012,6 +1060,93 @@ async def list_tickers(user: CurrentUser = Depends(get_current_user), session: S
     return [{"symbol": symbol, "notes": notes, "open_calls": open_call_counts.get(symbol, 0), "first_mentioned_at": first.isoformat() if first else None} for symbol, notes, first in rows]
 
 
+@app.get("/api/company-workspaces")
+def list_company_workspaces(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    preference = session.get(UserWorkspacePreference, user.id)
+    active_security_id = preference.active_security_id if preference else None
+    workspaces = session.execute(
+        select(CompanyWorkspace, Security)
+        .join(Security, Security.id == CompanyWorkspace.security_id)
+        .where(CompanyWorkspace.user_id == user.id)
+        .order_by(CompanyWorkspace.is_followed.desc(), Security.symbol)
+    ).all()
+    return [_workspace_payload(session, workspace, security, active_security_id) for workspace, security in workspaces]
+
+
+@app.post("/api/company-workspaces")
+def create_company_workspace(payload: CompanyWorkspaceRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, payload.symbol, create=True)
+    if payload.company_name is not None:
+        security.company_name = payload.company_name.strip() or None
+    workspace.company_description = payload.company_description
+    workspace.business_model = payload.business_model
+    workspace.is_followed = payload.is_followed
+    preference = session.get(UserWorkspacePreference, user.id)
+    if preference is None:
+        preference = UserWorkspacePreference(user_id=user.id, active_security_id=security.id)
+        session.add(preference)
+    session.commit()
+    return _workspace_payload(session, workspace, security, preference.active_security_id)
+
+
+@app.get("/api/company-workspaces/active")
+def active_company_workspace(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    preference = session.get(UserWorkspacePreference, user.id)
+    if preference is None or preference.active_security_id is None:
+        return None
+    workspace = session.scalar(select(CompanyWorkspace).where(CompanyWorkspace.user_id == user.id, CompanyWorkspace.security_id == preference.active_security_id))
+    security = session.get(Security, preference.active_security_id)
+    return _workspace_payload(session, workspace, security, preference.active_security_id) if workspace and security else None
+
+
+@app.delete("/api/company-workspaces/active")
+def clear_active_company_workspace(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    preference = session.get(UserWorkspacePreference, user.id)
+    if preference:
+        preference.active_security_id = None
+        session.commit()
+    return {"active": None}
+
+
+@app.post("/api/company-workspaces/{symbol}/activate")
+def activate_company_workspace(symbol: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol, create=True)
+    preference = session.get(UserWorkspacePreference, user.id)
+    if preference is None:
+        preference = UserWorkspacePreference(user_id=user.id)
+        session.add(preference)
+    preference.active_security_id = security.id
+    session.commit()
+    return _workspace_payload(session, workspace, security, security.id)
+
+
+@app.get("/api/company-workspaces/{symbol}")
+def company_workspace_detail(symbol: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None:
+        raise HTTPException(status_code=404, detail="Company workspace not found")
+    preference = session.get(UserWorkspacePreference, user.id)
+    return _workspace_payload(session, workspace, security, preference.active_security_id if preference else None)
+
+
+@app.put("/api/company-workspaces/{symbol}")
+def update_company_workspace(symbol: str, payload: CompanyWorkspaceUpdateRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None:
+        raise HTTPException(status_code=404, detail="Company workspace not found")
+    if payload.company_name is not None:
+        security.company_name = payload.company_name.strip() or None
+    if payload.company_description is not None:
+        workspace.company_description = payload.company_description
+    if payload.business_model is not None:
+        workspace.business_model = payload.business_model
+    if payload.is_followed is not None:
+        workspace.is_followed = payload.is_followed
+    session.commit()
+    preference = session.get(UserWorkspacePreference, user.id)
+    return _workspace_payload(session, workspace, security, preference.active_security_id if preference else None)
+
+
 @app.get("/api/tickers/{symbol}")
 async def ticker_detail(symbol: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
     security = session.scalar(select(Security).where(Security.symbol == symbol.upper()))
@@ -1050,6 +1185,7 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
     parsed = parse_note(payload.body, payload.note_type)
     if parsed["errors"] or parsed["warnings"]:
         raise HTTPException(status_code=422, detail={"errors": parsed["errors"], "warnings": parsed["warnings"]})
+    parsed = _scope_parsed_to_active_company(session, user.id, parsed, payload.active_ticker)
     quotes = {}
     if parsed["tracked_calls"]:
         provider = YFinanceMarketDataProvider()
@@ -1066,7 +1202,7 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
                 quote_failures[symbol] = str(exc)
         if quote_failures:
             raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
-    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title or capture_title(parsed), status="published", quotes=quotes)
+    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title or capture_title(payload.body, parsed), status="published", quotes=quotes)
     link_note_source_url(session, user.id, note, payload.source_url)
     save_thesis_details(session, note.id, payload.thesis_details)
     _create_pending_questions(session, user.id, note, payload.pending_questions)

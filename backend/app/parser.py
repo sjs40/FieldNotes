@@ -60,14 +60,14 @@ def parse_note(body: str, note_type: str = "note") -> dict:
     return {"note_type": note_type, "clean_body": clean, "tags": tags, "ticker_mentions": tickers, "tracked_calls": calls, "note_targets": orphan_targets, "warnings": warnings, "errors": [] if clean else ["Note body is required."]}
 
 
-def capture_title(parsed: dict) -> str:
-    """Derive a human-readable title from the first line of a quick capture."""
-    first_line = (parsed.get("clean_body") or "").splitlines()[0] if parsed.get("clean_body") else ""
-    without_metadata = re.sub(r"https?://[^\s)\]}>,]+", "", first_line, flags=re.I)
-    without_metadata = re.sub(r"\$[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z])?", "", without_metadata)
-    without_metadata = re.sub(r"#[\w-]+", "", without_metadata)
-    without_metadata = re.sub(r"\s+", " ", without_metadata).strip(" -–—|·")
-    return without_metadata[:500]
+def capture_title(body: str, parsed: dict) -> str:
+    """Use the first plain-text line as title; syntax-bearing lines are metadata."""
+    for line in body.splitlines():
+        candidate = line.strip()
+        if not candidate or any(token in candidate for token in ("/", "#", "$")):
+            continue
+        return re.sub(r"\s+", " ", candidate)[:500]
+    return ""
 
 
 def _target_on_line(line: str) -> float | None:

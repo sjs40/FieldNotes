@@ -33,6 +33,21 @@
 .floating-capture kbd { float: right; border: 1px solid #ffffff66; border-radius: 4px; padding: 1px 4px; font: 10px 'DM Mono'; }
 .mobile-floating-capture { display: none; }
 .all-page > section .section-head { margin-top: 31px; }
+.active-company-control { display: grid; gap: 5px; margin: 18px 10px; color: var(--muted); font: 10px 'DM Mono'; text-transform: uppercase; letter-spacing: .5px; }
+.active-company-control select { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 7px; background: #fffefa; color: var(--ink); font: 12px 'DM Sans'; text-transform: none; }
+.company-add { padding: 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+.company-add h2 { margin: 0 0 12px; font-size: 15px; }
+.company-add-grid { display: grid; grid-template-columns: minmax(130px,.5fr) 1fr auto; gap: 8px; }
+.company-add input { min-width: 0; border: 1px solid var(--line); border-radius: 6px; padding: 9px; background: #fffefa; }
+.company-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(245px,1fr)); gap: 12px; }
+.company-card { display: flex; justify-content: space-between; gap: 10px; min-height: 150px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); cursor: pointer; }
+.company-card:hover, .company-card.active { border-color: #8eaa9a; background: #f6faf6; }
+.company-card h3 { margin: 7px 0 5px; font-size: 15px; }
+.company-card p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.company-card small { display: block; margin-top: 10px; color: var(--muted); font: 10px 'DM Mono'; }
+.company-profile { display: grid; gap: 14px; }
+.company-profile label { color: var(--muted); font-size: 12px; font-weight: 600; }
+.company-profile textarea { display: block; width: 100%; min-height: 100px; margin-top: 5px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: #fffefa; font: 14px/1.5 'DM Sans'; }
 
 @media (max-width: 850px) {
   .capture-composer { padding: 18px; }
@@ -42,4 +57,6 @@
   .capture-meta .syntax-hint { white-space: normal; }
   .sidebar .floating-capture { display: none; }
   .mobile-floating-capture { display: grid; place-items: center; position: fixed; right: 16px; bottom: 84px; z-index: 21; width: 48px; height: 48px; margin: 0; border-radius: 50%; padding: 0; font-size: 28px; box-shadow: 0 6px 20px #0003; }
+  .company-add-grid { grid-template-columns: 1fr; }
+  .company-grid { grid-template-columns: 1fr; }
 }
