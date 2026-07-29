@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -20,7 +21,7 @@ from hashlib import sha256
 import secrets
 from .reviews import OUTCOMES, REVIEW_TYPES, STATUSES, generate as generate_reviews, serialize_review, settings_for
 from .timeline import thinking_evolution, ticker_timeline
-from .inbox import capture as inbox_capture, clean_html
+from .inbox import capture as inbox_capture, clean_html, normalize_url
 
 app = FastAPI(title="Fieldnotes API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"], allow_methods=["*"], allow_headers=["*"])
@@ -40,6 +41,7 @@ class PublishRequest(BaseModel):
     body: str
     note_type: str = "note"
     title: str = ""
+    source_url: str | None = None
     thesis_details: dict | None = None
     pending_questions: list[dict] = []
 
@@ -218,6 +220,13 @@ def serialized_note(session: Session, note: Note) -> dict:
     result["relationship_summary"]={"follow_up_count":len(incoming),"supporting_count":sum(r.relationship_type=="supports" for r in relations),"contradiction_count":sum(r.relationship_type=="contradicts" for r in relations),"superseded_by":next((r.from_note_id for r in incoming if r.relationship_type=="supersedes"),None)}
     result["open_question_count"]=session.scalar(select(func.count(ResearchQuestion.id)).where(ResearchQuestion.originating_note_id==note.id,ResearchQuestion.status.in_(("open","partially_answered")))) or 0
     result["evidence_count"]=session.scalar(select(func.count(Evidence.id)).where(Evidence.originating_note_id==note.id)) or 0
+    sources = session.execute(
+        select(Source.id, Source.title, Source.canonical_url)
+        .join(NoteSource, NoteSource.source_id == Source.id)
+        .where(NoteSource.note_id == note.id)
+        .order_by(NoteSource.created_at.asc())
+    ).all()
+    result["sources"] = [{"id": source_id, "title": title, "url": url} for source_id, title, url in sources]
     details = session.scalar(select(ThesisDetails).where(ThesisDetails.note_id == note.id))
     if details:
         result["thesis_details"] = {"core_thesis": details.core_thesis, "key_evidence": details.key_evidence_json, "catalysts": details.catalysts_json, "risks": details.risks_json, "invalidation_conditions": details.invalidation_conditions_json, "valuation_notes": details.valuation_notes, "expected_time_horizon_days": details.expected_time_horizon_days, "review_at": details.review_at.isoformat() if details.review_at else None}
@@ -231,6 +240,31 @@ def save_thesis_details(session: Session, note_id: str, payload: dict | None) ->
     values = {key: value for key, value in payload.items() if key in allowed}
     values.update({column: payload.get(key, []) for key, column in lists.items()})
     session.add(ThesisDetails(note_id=note_id, **values))
+
+
+def link_note_source_url(session: Session, user_id: str, note: Note, source_url: str | None) -> None:
+    """Link an optional article URL without creating an Inbox item or fetching it."""
+    if not source_url or not source_url.strip():
+        return
+    original_url = source_url.strip()
+    parts = urlsplit(original_url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise HTTPException(status_code=422, detail="Source URL must be a valid http(s) URL")
+    canonical_url = normalize_url(original_url)
+    source = session.scalar(select(Source).where(Source.user_id == user_id, Source.canonical_url == canonical_url))
+    if source is None:
+        source = Source(
+            user_id=user_id,
+            source_type="article",
+            canonical_url=canonical_url,
+            original_url=original_url,
+            title=note.title or None,
+            content_status="partial",
+        )
+        session.add(source)
+        session.flush()
+    if session.get(NoteSource, {"note_id": note.id, "source_id": source.id}) is None:
+        session.add(NoteSource(note_id=note.id, source_id=source.id, relationship_type="references"))
 
 
 def record_frontend_note(session: Session, incoming: dict) -> Note:
@@ -348,6 +382,7 @@ async def create_draft(payload: PublishRequest, user: CurrentUser = Depends(get_
     if parsed["errors"]:
         raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
     note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="draft")
+    link_note_source_url(session, user.id, note, payload.source_url)
     save_thesis_details(session, note.id, payload.thesis_details)
     _create_pending_questions(session, user.id, note, payload.pending_questions)
     session.commit()
@@ -1031,6 +1066,7 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
     if parsed["tracked_calls"] and quote_failures:
         raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
     note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published", quotes=quotes)
+    link_note_source_url(session, user.id, note, payload.source_url)
     save_thesis_details(session, note.id, payload.thesis_details)
     _create_pending_questions(session, user.id, note, payload.pending_questions)
     session.commit()

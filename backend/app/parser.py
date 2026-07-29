@@ -1,12 +1,12 @@
 """Deterministic lightweight syntax parsing; deliberately no LLM dependency."""
 import re
 
-TYPE_MAP = {"o": "observation", "i": "idea", "th": "thesis", "q": "question", "t": "task", "d": "decision", "n": "note"}
+TYPE_MAP = {"o": "observation", "i": "idea", "th": "thesis", "q": "question", "t": "task", "d": "decision", "n": "note", "news": "news"}
 
 
 def parse_note(body: str, note_type: str = "note") -> dict:
     clean = body.strip()
-    command = re.match(r"^/(o|i|th|q|t|d|n)\b\s*", clean, re.I)
+    command = re.match(r"^/(o|i|th|q|t|d|n|news)\b\s*", clean, re.I)
     if command:
         note_type = TYPE_MAP[command.group(1).lower()]
         clean = clean[command.end():]
