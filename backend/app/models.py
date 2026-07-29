@@ -393,6 +393,9 @@ class Forecast(Base):
     assumption_id: Mapped[str | None] = mapped_column(ForeignKey("assumptions.id"), nullable=True)
     metric_name: Mapped[str] = mapped_column(String(255))
     metric_definition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expected_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    resolution_event: Mapped[str | None] = mapped_column(String(255), nullable=True)
     forecast_type: Mapped[str] = mapped_column(String(16), default="point")
     target_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
     lower_bound: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
@@ -406,12 +409,15 @@ class Forecast(Base):
     resolution_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
     resolution_source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id"), nullable=True)
     resolution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution_observation_id: Mapped[str | None] = mapped_column(ForeignKey("kpi_observations.id"), nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_value: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
     error_percentage: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
     outcome: Mapped[str | None] = mapped_column(String(24), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    supersedes_forecast_id: Mapped[str | None] = mapped_column(ForeignKey("forecasts.id"), nullable=True, index=True)
+    revision_number: Mapped[int] = mapped_column(Integer, default=1)
 
 class ForecastEvent(Base):
     __tablename__ = "forecast_events"
@@ -442,6 +448,37 @@ class MetricCard(Base):
     __tablename__="metric_cards"
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); user_id: Mapped[str]=mapped_column(String(36),index=True); security_id: Mapped[str|None]=mapped_column(ForeignKey("securities.id"),nullable=True,index=True); note_id: Mapped[str|None]=mapped_column(ForeignKey("notes.id"),nullable=True); source_id: Mapped[str|None]=mapped_column(ForeignKey("sources.id"),nullable=True); forecast_id: Mapped[str|None]=mapped_column(ForeignKey("forecasts.id"),nullable=True)
     metric_name: Mapped[str]=mapped_column(String(255)); metric_definition: Mapped[str|None]=mapped_column(Text,nullable=True); value: Mapped[float]=mapped_column(Numeric(20,6)); value_unit: Mapped[str|None]=mapped_column(String(32),nullable=True); period: Mapped[str]=mapped_column(String(128)); prior_value: Mapped[float|None]=mapped_column(Numeric(20,6),nullable=True); consensus_value: Mapped[float|None]=mapped_column(Numeric(20,6),nullable=True); source_excerpt: Mapped[str|None]=mapped_column(Text,nullable=True); interpretation: Mapped[str|None]=mapped_column(Text,nullable=True); data_json: Mapped[dict]=mapped_column(JSON,default=dict); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=datetime.utcnow); updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=datetime.utcnow,onupdate=datetime.utcnow)
+
+
+class KpiDefinition(Base):
+    __tablename__ = "kpi_definitions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    security_id: Mapped[str] = mapped_column(ForeignKey("securities.id"), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    definition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    value_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "security_id", "name", name="uq_kpi_definition_name"),)
+
+
+class KpiObservation(Base):
+    __tablename__ = "kpi_observations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    kpi_definition_id: Mapped[str] = mapped_column(ForeignKey("kpi_definitions.id"), index=True)
+    earnings_event_id: Mapped[str | None] = mapped_column(ForeignKey("earnings_events.id"), nullable=True, index=True)
+    note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id"), nullable=True)
+    period: Mapped[str] = mapped_column(String(128), default="Unscheduled")
+    value: Mapped[float | None] = mapped_column(Numeric(20, 6), nullable=True)
+    value_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    interpretation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class Idea(Base):
     __tablename__="ideas"

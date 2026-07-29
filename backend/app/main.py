@@ -10,7 +10,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, CompanyWorkspace, EarningsEvent, EarningsEventNote, EarningsEventSource, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, Idea, IdeaSecurity, InboxItem, MetricCard, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings, UserWorkspacePreference, WeeklyReview
+from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, CompanyWorkspace, EarningsEvent, EarningsEventNote, EarningsEventSource, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, Idea, IdeaSecurity, InboxItem, KpiDefinition, KpiObservation, MetricCard, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings, UserWorkspacePreference, WeeklyReview
 from .parser import capture_title, parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -115,6 +115,10 @@ class LedgerRequest(BaseModel):
 class ForecastRequest(BaseModel):
     metric_name: str = Field(min_length=1, max_length=255)
     ticker: str | None = None
+    metric_definition: str | None = Field(default=None, max_length=10000)
+    expected_outcome: str | None = Field(default=None, max_length=50000)
+    confidence: str | None = None
+    resolution_event: str | None = Field(default=None, max_length=255)
     forecast_type: str = "point"
     target_value: float | None = None
     lower_bound: float | None = None
@@ -122,7 +126,7 @@ class ForecastRequest(BaseModel):
     value_unit: str | None = None
     direction: str | None = None
     probability: float | None = Field(default=None, ge=0, le=1)
-    target_period_start: datetime
+    target_period_start: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     target_period_end: datetime | None = None
     note_id: str | None = None
     assumption_id: str | None = None
@@ -132,6 +136,30 @@ class ForecastResolutionRequest(BaseModel):
     outcome: str
     resolution_source_id: str | None = None
     resolution_note: str | None = None
+    kpi_observation_id: str | None = None
+
+
+class ForecastRevisionRequest(ForecastRequest):
+    pass
+
+
+class KpiDefinitionRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    definition: str | None = Field(default=None, max_length=10000)
+    value_unit: str | None = Field(default=None, max_length=32)
+    is_active: bool = True
+
+
+class KpiObservationRequest(BaseModel):
+    kpi_definition_id: str
+    period: str = Field(default="Unscheduled", min_length=1, max_length=128)
+    value: float | None = None
+    value_text: str | None = Field(default=None, max_length=50000)
+    interpretation: str | None = Field(default=None, max_length=50000)
+    earnings_event_id: str | None = None
+    note_id: str | None = None
+    source_id: str | None = None
+    observed_at: datetime | None = None
 
 class UpdateAssumptionRequest(BaseModel):
     status: str | None = None
@@ -673,14 +701,57 @@ def research_queue(ticker:str|None=None,status_value:str|None=None,limit:int=100
     rows=session.scalars(q.order_by(ResearchQuestion.priority.desc(),ResearchQuestion.due_at.asc().nulls_last(),ResearchQuestion.created_at.asc()).offset(max(offset,0)).limit(min(max(limit,1),200))).all()
     return [{"id":x.id,"question":x.question,"status":x.status,"priority":x.priority,"due_at":x.due_at.isoformat() if x.due_at else None,"security_id":x.security_id} for x in rows]
 
+FORECAST_TYPES = {"point", "minimum", "maximum", "range", "direction", "event", "probability", "qualitative"}
+FORECAST_CONFIDENCES = {"low", "medium", "high"}
+
+
+def _serialize_forecast(value: Forecast) -> dict:
+    return {"id": value.id, "metric_name": value.metric_name, "metric_definition": value.metric_definition, "forecast_type": value.forecast_type, "target_value": float(value.target_value) if value.target_value is not None else None, "lower_bound": float(value.lower_bound) if value.lower_bound is not None else None, "upper_bound": float(value.upper_bound) if value.upper_bound is not None else None, "value_unit": value.value_unit, "direction": value.direction, "probability": float(value.probability) if value.probability is not None else None, "expected_outcome": value.expected_outcome, "confidence": value.confidence, "resolution_event": value.resolution_event, "target_period_start": value.target_period_start.isoformat(), "target_period_end": value.target_period_end.isoformat() if value.target_period_end else None, "status": value.status, "resolution_value": float(value.resolution_value) if value.resolution_value is not None else None, "resolution_note": value.resolution_note, "outcome": value.outcome, "error_value": float(value.error_value) if value.error_value is not None else None, "error_percentage": float(value.error_percentage) if value.error_percentage is not None else None, "resolution_observation_id": value.resolution_observation_id, "supersedes_forecast_id": value.supersedes_forecast_id, "revision_number": value.revision_number, "created_at": value.created_at.isoformat(), "resolved_at": value.resolved_at.isoformat() if value.resolved_at else None}
+
+
+def _forecast_from_request(payload: ForecastRequest, user_id: str, security_id: str | None, *, supersedes_forecast_id: str | None = None, revision_number: int = 1) -> Forecast:
+    return Forecast(user_id=user_id, security_id=security_id, originating_note_id=payload.note_id, assumption_id=payload.assumption_id, metric_name=payload.metric_name, metric_definition=payload.metric_definition, expected_outcome=payload.expected_outcome, confidence=payload.confidence, resolution_event=payload.resolution_event, forecast_type=payload.forecast_type, target_value=payload.target_value, lower_bound=payload.lower_bound, upper_bound=payload.upper_bound, value_unit=payload.value_unit, direction=payload.direction, probability=payload.probability, target_period_start=payload.target_period_start, target_period_end=payload.target_period_end, supersedes_forecast_id=supersedes_forecast_id, revision_number=revision_number)
+
+
+def _validate_forecast_request(session: Session, payload: ForecastRequest, user_id: str) -> Security | None:
+    security = _security_for_ticker(session, payload.ticker)
+    if payload.note_id: _owned_note(session, payload.note_id, user_id)
+    if payload.assumption_id and not session.scalar(select(Assumption).where(Assumption.id == payload.assumption_id, Assumption.user_id == user_id)): raise HTTPException(404, "Assumption not found")
+    if payload.forecast_type not in FORECAST_TYPES: raise HTTPException(422, "Invalid forecast type")
+    if payload.confidence and payload.confidence not in FORECAST_CONFIDENCES: raise HTTPException(422, "Invalid forecast confidence")
+    if payload.target_period_end and payload.target_period_end < payload.target_period_start: raise HTTPException(422, "Forecast period end must follow start")
+    if payload.forecast_type == "qualitative" and not payload.expected_outcome: raise HTTPException(422, "Qualitative forecasts need an expected outcome")
+    return security
+
+
 @app.post("/api/forecasts")
-def create_forecast(payload:ForecastRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
-    security=_security_for_ticker(session,payload.ticker)
-    if payload.note_id:_owned_note(session,payload.note_id,user.id)
-    if payload.assumption_id and not session.scalar(select(Assumption).where(Assumption.id==payload.assumption_id,Assumption.user_id==user.id)):raise HTTPException(404,"Assumption not found")
-    if payload.forecast_type not in {"point","minimum","maximum","range","direction","event","probability"}:raise HTTPException(422,"Invalid forecast type")
-    if payload.target_period_end and payload.target_period_end < payload.target_period_start:raise HTTPException(422,"Forecast period end must follow start")
-    value=Forecast(user_id=user.id,security_id=security.id if security else None,originating_note_id=payload.note_id,assumption_id=payload.assumption_id,metric_name=payload.metric_name,forecast_type=payload.forecast_type,target_value=payload.target_value,lower_bound=payload.lower_bound,upper_bound=payload.upper_bound,value_unit=payload.value_unit,direction=payload.direction,probability=payload.probability,target_period_start=payload.target_period_start,target_period_end=payload.target_period_end);session.add(value);session.commit();return {"id":value.id,"metric_name":value.metric_name,"status":value.status}
+def create_forecast(payload: ForecastRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    security = _validate_forecast_request(session, payload, user.id)
+    value = _forecast_from_request(payload, user.id, security.id if security else None)
+    session.add(value); session.flush(); session.add(ForecastEvent(forecast_id=value.id, user_id=user.id, event_type="created", snapshot_json={"revision_number": 1}, explanation=None)); session.commit()
+    return _serialize_forecast(value)
+
+
+@app.get("/api/forecasts")
+def list_forecasts(ticker: str | None = None, status_value: str | None = None, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    query = select(Forecast).where(Forecast.user_id == user.id)
+    if ticker:
+        security = _security_for_ticker(session, ticker); query = query.where(Forecast.security_id == security.id) if security else query.where(False)
+    if status_value: query = query.where(Forecast.status == status_value)
+    return [_serialize_forecast(value) for value in session.scalars(query.order_by(Forecast.created_at.desc())).all()]
+
+
+@app.post("/api/forecasts/{forecast_id}/revise")
+def revise_forecast(forecast_id: str, payload: ForecastRevisionRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    prior = session.scalar(select(Forecast).where(Forecast.id == forecast_id, Forecast.user_id == user.id))
+    if not prior: raise HTTPException(404, "Forecast not found")
+    if prior.status != "open": raise HTTPException(409, "Only open forecasts can be revised")
+    security = _validate_forecast_request(session, payload, user.id)
+    if security and security.id != prior.security_id: raise HTTPException(422, "A revision must remain with the same company")
+    value = _forecast_from_request(payload, user.id, prior.security_id, supersedes_forecast_id=prior.id, revision_number=(prior.revision_number or 1) + 1)
+    prior.status = "superseded"
+    session.add(value); session.flush(); session.add(ForecastEvent(forecast_id=prior.id, user_id=user.id, event_type="superseded", snapshot_json={"replacement_forecast_id": value.id}, explanation=None)); session.add(ForecastEvent(forecast_id=value.id, user_id=user.id, event_type="revised", snapshot_json={"supersedes_forecast_id": prior.id, "revision_number": value.revision_number}, explanation=None)); session.commit()
+    return _serialize_forecast(value)
 
 @app.post("/api/forecasts/{forecast_id}/resolve")
 def resolve_forecast(forecast_id:str,payload:ForecastResolutionRequest,user:CurrentUser=Depends(get_current_user),session:Session=Depends(get_session)):
@@ -689,10 +760,13 @@ def resolve_forecast(forecast_id:str,payload:ForecastResolutionRequest,user:Curr
     if value.status!="open":raise HTTPException(409,"Forecast is already resolved")
     if payload.outcome not in {"correct","partially_correct","incorrect","unresolvable"}:raise HTTPException(422,"Invalid forecast outcome")
     if payload.resolution_source_id and not session.scalar(select(Source).where(Source.id==payload.resolution_source_id,Source.user_id==user.id)):raise HTTPException(404,"Source not found")
-    value.status="resolved";value.outcome=payload.outcome;value.resolution_value=payload.resolution_value;value.resolution_source_id=payload.resolution_source_id;value.resolution_note=payload.resolution_note;value.resolved_at=datetime.now(timezone.utc)
-    if value.target_value is not None and payload.resolution_value is not None:
-        value.error_value=float(payload.resolution_value)-float(value.target_value);value.error_percentage=value.error_value/abs(float(value.target_value)) if value.target_value else None
-    session.add(ForecastEvent(forecast_id=value.id,user_id=user.id,event_type="resolved",snapshot_json={"resolution_value":payload.resolution_value,"outcome":payload.outcome,"error_value":float(value.error_value) if value.error_value is not None else None},explanation=payload.resolution_note))
+    observation = session.scalar(select(KpiObservation).where(KpiObservation.id == payload.kpi_observation_id, KpiObservation.user_id == user.id)) if payload.kpi_observation_id else None
+    if payload.kpi_observation_id and observation is None: raise HTTPException(404, "KPI observation not found")
+    resolved_value = payload.resolution_value if payload.resolution_value is not None else (float(observation.value) if observation and observation.value is not None else None)
+    value.status="resolved";value.outcome=payload.outcome;value.resolution_value=resolved_value;value.resolution_source_id=payload.resolution_source_id;value.resolution_observation_id=observation.id if observation else None;value.resolution_note=payload.resolution_note;value.resolved_at=datetime.now(timezone.utc)
+    if value.target_value is not None and resolved_value is not None:
+        value.error_value=float(resolved_value)-float(value.target_value);value.error_percentage=value.error_value/abs(float(value.target_value)) if value.target_value else None
+    session.add(ForecastEvent(forecast_id=value.id,user_id=user.id,event_type="resolved",snapshot_json={"resolution_value":resolved_value,"outcome":payload.outcome,"error_value":float(value.error_value) if value.error_value is not None else None,"kpi_observation_id":value.resolution_observation_id},explanation=payload.resolution_note))
     session.commit();return {"id":value.id,"status":value.status,"outcome":value.outcome,"error_value":float(value.error_value) if value.error_value is not None else None}
 
 @app.patch("/api/assumptions/{assumption_id}")
@@ -1240,6 +1314,66 @@ def update_earnings_event(symbol: str, event_id: str, payload: EarningsEventRequ
     _replace_earnings_links(session, event, user.id, payload.note_ids if "note_ids" in fields else None, payload.source_ids if "source_ids" in fields else None)
     session.commit()
     return _earnings_payload(session, event)
+
+
+def _serialize_kpi_definition(definition: KpiDefinition, observations: list[KpiObservation] | None = None) -> dict:
+    return {"id": definition.id, "name": definition.name, "definition": definition.definition, "value_unit": definition.value_unit, "is_active": definition.is_active, "created_at": definition.created_at.isoformat(), "observations": [{"id": observation.id, "period": observation.period, "value": float(observation.value) if observation.value is not None else None, "value_text": observation.value_text, "interpretation": observation.interpretation, "earnings_event_id": observation.earnings_event_id, "observed_at": observation.observed_at.isoformat()} for observation in (observations or [])]}
+
+
+@app.get("/api/company-workspaces/{symbol}/kpis")
+def company_kpis(symbol: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None: raise HTTPException(404, "Company workspace not found")
+    definitions = session.scalars(select(KpiDefinition).where(KpiDefinition.user_id == user.id, KpiDefinition.security_id == security.id).order_by(KpiDefinition.is_active.desc(), KpiDefinition.name)).all()
+    observations = session.scalars(select(KpiObservation).join(KpiDefinition, KpiDefinition.id == KpiObservation.kpi_definition_id).where(KpiObservation.user_id == user.id, KpiDefinition.security_id == security.id).order_by(KpiObservation.observed_at.desc())).all()
+    by_definition: dict[str, list[KpiObservation]] = {}
+    for observation in observations: by_definition.setdefault(observation.kpi_definition_id, []).append(observation)
+    return [_serialize_kpi_definition(definition, by_definition.get(definition.id, [])) for definition in definitions]
+
+
+@app.post("/api/company-workspaces/{symbol}/kpis")
+def create_kpi_definition(symbol: str, payload: KpiDefinitionRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None: raise HTTPException(404, "Company workspace not found")
+    name = payload.name.strip()
+    value = session.scalar(select(KpiDefinition).where(KpiDefinition.user_id == user.id, KpiDefinition.security_id == security.id, KpiDefinition.name == name))
+    if value is None:
+        value = KpiDefinition(user_id=user.id, security_id=security.id, name=name, definition=payload.definition, value_unit=payload.value_unit, is_active=payload.is_active)
+        session.add(value)
+    else:
+        value.definition = payload.definition
+        value.value_unit = payload.value_unit
+        value.is_active = payload.is_active
+    session.commit()
+    return _serialize_kpi_definition(value)
+
+
+@app.post("/api/company-workspaces/{symbol}/kpis/observations")
+def create_kpi_observation(symbol: str, payload: KpiObservationRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None: raise HTTPException(404, "Company workspace not found")
+    definition = session.scalar(select(KpiDefinition).where(KpiDefinition.id == payload.kpi_definition_id, KpiDefinition.user_id == user.id, KpiDefinition.security_id == security.id))
+    if definition is None: raise HTTPException(404, "KPI definition not found")
+    if payload.value is None and not (payload.value_text or "").strip(): raise HTTPException(422, "Record a numeric value or qualitative observation")
+    if payload.note_id: _owned_note(session, payload.note_id, user.id)
+    if payload.source_id and not session.scalar(select(Source).where(Source.id == payload.source_id, Source.user_id == user.id)): raise HTTPException(404, "Source not found")
+    if payload.earnings_event_id and not session.scalar(select(EarningsEvent).where(EarningsEvent.id == payload.earnings_event_id, EarningsEvent.user_id == user.id, EarningsEvent.security_id == security.id)): raise HTTPException(404, "Earnings event not found")
+    value = KpiObservation(user_id=user.id, kpi_definition_id=definition.id, earnings_event_id=payload.earnings_event_id, note_id=payload.note_id, source_id=payload.source_id, period=payload.period.strip() or "Unscheduled", value=payload.value, value_text=payload.value_text, interpretation=payload.interpretation, observed_at=payload.observed_at or datetime.now(timezone.utc))
+    session.add(value); session.commit()
+    return _serialize_kpi_definition(definition, [value])["observations"][0]
+
+
+@app.get("/api/company-workspaces/{symbol}/forecast-scorecard")
+def company_forecast_scorecard(symbol: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None: raise HTTPException(404, "Company workspace not found")
+    forecasts = session.scalars(select(Forecast).where(Forecast.user_id == user.id, Forecast.security_id == security.id).order_by(Forecast.created_at.desc())).all()
+    resolved = [forecast for forecast in forecasts if forecast.status == "resolved"]
+    point = [forecast for forecast in resolved if forecast.target_value is not None and forecast.resolution_value is not None]
+    ranges = [forecast for forecast in resolved if forecast.lower_bound is not None and forecast.upper_bound is not None and forecast.resolution_value is not None]
+    qualitative = [forecast for forecast in resolved if forecast.forecast_type in {"qualitative", "direction", "event", "probability"}]
+    correct_qualitative = [forecast for forecast in qualitative if forecast.outcome == "correct"]
+    return {"forecasts": [_serialize_forecast(forecast) for forecast in forecasts], "summary": {"open_count": len([forecast for forecast in forecasts if forecast.status == "open"]), "superseded_count": len([forecast for forecast in forecasts if forecast.status == "superseded"]), "resolved_count": len(resolved), "point_count": len(point), "mean_absolute_error": sum(abs(float(forecast.error_value)) for forecast in point) / len(point) if point else None, "mean_signed_error": sum(float(forecast.error_value) for forecast in point) / len(point) if point else None, "range_count": len(ranges), "range_hit_rate": sum(1 for forecast in ranges if float(forecast.lower_bound) <= float(forecast.resolution_value) <= float(forecast.upper_bound)) / len(ranges) if ranges else None, "qualitative_count": len(qualitative), "qualitative_accuracy": len(correct_qualitative) / len(qualitative) if qualitative else None}}
 
 
 @app.get("/api/company-workspaces/{symbol}")
