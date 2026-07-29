@@ -10,6 +10,8 @@
     setTimeout(() => item.remove(), 4200);
   }
   function addButton() {
+    const activePage = document.querySelector('.sidebar .nav button.active')?.dataset.page;
+    if (!['dashboard', 'calls'].includes(activePage)) return;
     const heading = document.querySelector('.topbar');
     if (!heading || document.querySelector('#refresh-prices')) return;
     const target = heading.querySelector('.today') || heading.lastElementChild;
