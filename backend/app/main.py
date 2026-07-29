@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
@@ -1374,6 +1374,96 @@ def company_forecast_scorecard(symbol: str, user: CurrentUser = Depends(get_curr
     qualitative = [forecast for forecast in resolved if forecast.forecast_type in {"qualitative", "direction", "event", "probability"}]
     correct_qualitative = [forecast for forecast in qualitative if forecast.outcome == "correct"]
     return {"forecasts": [_serialize_forecast(forecast) for forecast in forecasts], "summary": {"open_count": len([forecast for forecast in forecasts if forecast.status == "open"]), "superseded_count": len([forecast for forecast in forecasts if forecast.status == "superseded"]), "resolved_count": len(resolved), "point_count": len(point), "mean_absolute_error": sum(abs(float(forecast.error_value)) for forecast in point) / len(point) if point else None, "mean_signed_error": sum(float(forecast.error_value) for forecast in point) / len(point) if point else None, "range_count": len(ranges), "range_hit_rate": sum(1 for forecast in ranges if float(forecast.lower_bound) <= float(forecast.resolution_value) <= float(forecast.upper_bound)) / len(ranges) if ranges else None, "qualitative_count": len(qualitative), "qualitative_accuracy": len(correct_qualitative) / len(qualitative) if qualitative else None}}
+
+
+def _utc(value: datetime | None) -> datetime | None:
+    if value is None: return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+@app.get("/api/company-review-queue")
+def company_review_queue(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    now = datetime.now(timezone.utc)
+    workspaces = session.execute(select(CompanyWorkspace, Security).join(Security, Security.id == CompanyWorkspace.security_id).where(CompanyWorkspace.user_id == user.id).order_by(Security.symbol)).all()
+    prompts = []
+    for workspace, security in workspaces:
+        symbol = security.symbol
+        if not (workspace.company_description or "").strip() or not (workspace.business_model or "").strip():
+            prompts.append({"id": f"{symbol}:profile", "ticker": symbol, "type": "company_profile", "severity": "medium", "title": "Complete company profile", "detail": "Add both a company description and how it makes money.", "action": "company"})
+        latest_note = session.scalar(select(func.max(Note.updated_at)).join(NoteSecurityMention, NoteSecurityMention.note_id == Note.id).where(Note.user_id == user.id, NoteSecurityMention.security_id == security.id))
+        latest_at = _utc(latest_note)
+        if latest_at is None or (now - latest_at).days > 45:
+            prompts.append({"id": f"{symbol}:research-stale", "ticker": symbol, "type": "stale_research", "severity": "high" if latest_at is None or (now - latest_at).days > 90 else "medium", "title": "Refresh company research", "detail": "No recent company-linked research is recorded." if latest_at is None else f"Last company-linked update was {(now - latest_at).days} days ago.", "action": "capture"})
+        questions = session.scalars(select(ResearchQuestion).where(ResearchQuestion.user_id == user.id, ResearchQuestion.security_id == security.id, ResearchQuestion.status.in_(("open", "partially_answered")))).all()
+        for question in questions:
+            prompts.append({"id": f"{symbol}:question:{question.id}", "ticker": symbol, "type": "unresolved_question", "severity": question.priority if question.priority in {"high", "critical"} else "medium", "title": question.question, "detail": "Unresolved research question.", "action": "company"})
+        forecasts = session.scalars(select(Forecast).where(Forecast.user_id == user.id, Forecast.security_id == security.id, Forecast.status == "open")).all()
+        for forecast in forecasts:
+            prompts.append({"id": f"{symbol}:forecast:{forecast.id}", "ticker": symbol, "type": "unresolved_forecast", "severity": "medium", "title": f"Resolve or revise: {forecast.metric_name}", "detail": forecast.resolution_event or "Open forecast has no resolution event set.", "action": "company"})
+        events = session.scalars(select(EarningsEvent).where(EarningsEvent.user_id == user.id, EarningsEvent.security_id == security.id)).all()
+        for event in events:
+            report_date = _utc(event.reporting_date)
+            if report_date and now <= report_date <= now + timedelta(days=365):
+                if not any(getattr(event, field) for field in EARNINGS_PRE_FIELDS):
+                    prompts.append({"id": f"{symbol}:earnings-pre:{event.id}", "ticker": symbol, "type": "upcoming_earnings", "severity": "high", "title": f"Prepare {event.fiscal_period} earnings", "detail": f"Reporting date: {report_date.date().isoformat()}", "action": "company"})
+            has_results = any(getattr(event, field) for field in ("earnings_results", "earnings_guidance", "earnings_kpi_observations", "earnings_notes"))
+            has_review = any(getattr(event, field) for field in ("post_expected_vs_actual", "post_thesis_impact", "post_question_resolution", "post_decision_action", "post_notes"))
+            if has_results and not has_review:
+                prompts.append({"id": f"{symbol}:earnings-post:{event.id}", "ticker": symbol, "type": "missing_post_earnings_review", "severity": "high", "title": f"Review {event.fiscal_period} earnings", "detail": "Results are recorded but expected-versus-actual review is missing.", "action": "company"})
+    rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    return sorted(prompts, key=lambda prompt: (rank.get(prompt["severity"], 4), prompt["ticker"], prompt["title"]))
+
+
+@app.get("/api/analytics/forecast-calibration")
+def forecast_calibration(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    forecasts = session.scalars(select(Forecast).where(Forecast.user_id == user.id, Forecast.status == "resolved")).all()
+    qualitative = [forecast for forecast in forecasts if forecast.forecast_type in {"qualitative", "direction", "event", "probability"}]
+    buckets = []
+    for confidence in ("low", "medium", "high", "not_set"):
+        rows = [forecast for forecast in qualitative if (forecast.confidence or "not_set") == confidence]
+        score = sum(1 if forecast.outcome == "correct" else .5 if forecast.outcome == "partially_correct" else 0 for forecast in rows)
+        buckets.append({"confidence": confidence, "count": len(rows), "calibrated_accuracy": score / len(rows) if rows else None})
+    numeric = [forecast for forecast in forecasts if forecast.target_value is not None and forecast.resolution_value is not None]
+    return {"qualitative": buckets, "numeric": {"count": len(numeric), "mean_absolute_error": sum(abs(float(forecast.error_value)) for forecast in numeric) / len(numeric) if numeric else None, "mean_signed_error": sum(float(forecast.error_value) for forecast in numeric) / len(numeric) if numeric else None}}
+
+
+@app.get("/api/analytics/kpis")
+def cross_company_kpis(name: str | None = None, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    query = select(KpiObservation, KpiDefinition, Security).join(KpiDefinition, KpiDefinition.id == KpiObservation.kpi_definition_id).join(Security, Security.id == KpiDefinition.security_id).where(KpiObservation.user_id == user.id)
+    if name: query = query.where(KpiDefinition.name.ilike(f"%{name.strip()}%"))
+    rows = session.execute(query.order_by(KpiDefinition.name, KpiObservation.observed_at.desc())).all()
+    return [{"ticker": security.symbol, "company_name": security.company_name, "kpi": definition.name, "definition": definition.definition, "unit": definition.value_unit, "period": observation.period, "value": float(observation.value) if observation.value is not None else None, "value_text": observation.value_text, "observed_at": observation.observed_at.isoformat()} for observation, definition, security in rows]
+
+
+@app.get("/api/analytics/earnings")
+def cross_company_earnings(user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    rows = session.execute(select(EarningsEvent, Security).join(Security, Security.id == EarningsEvent.security_id).where(EarningsEvent.user_id == user.id).order_by(EarningsEvent.reporting_date.desc(), EarningsEvent.created_at.desc())).all()
+    return [{"id": event.id, "ticker": security.symbol, "company_name": security.company_name, "fiscal_period": event.fiscal_period, "reporting_date": event.reporting_date.isoformat() if event.reporting_date else None, "has_preparation": any(getattr(event, field) for field in EARNINGS_PRE_FIELDS), "has_results": any(getattr(event, field) for field in ("earnings_results", "earnings_guidance", "earnings_kpi_observations", "earnings_notes")), "has_post_review": any(getattr(event, field) for field in ("post_expected_vs_actual", "post_thesis_impact", "post_question_resolution", "post_decision_action", "post_notes"))} for event, security in rows]
+
+
+@app.get("/api/company-workspaces/{symbol}/export")
+def export_company_workspace(symbol: str, kind: str = "memo", user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    if kind not in {"memo", "earnings-preview", "earnings-review", "timeline"}: raise HTTPException(422, "Unknown export kind")
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None: raise HTTPException(404, "Company workspace not found")
+    notes = session.scalars(select(Note).join(NoteSecurityMention, NoteSecurityMention.note_id == Note.id).where(Note.user_id == user.id, NoteSecurityMention.security_id == security.id).order_by(Note.created_at.desc())).all()
+    events = session.scalars(select(EarningsEvent).where(EarningsEvent.user_id == user.id, EarningsEvent.security_id == security.id).order_by(EarningsEvent.reporting_date.desc(), EarningsEvent.created_at.desc())).all()
+    forecasts = session.scalars(select(Forecast).where(Forecast.user_id == user.id, Forecast.security_id == security.id).order_by(Forecast.created_at.desc())).all()
+    sources = session.scalars(select(Source).join(NoteSource, NoteSource.source_id == Source.id).join(Note, Note.id == NoteSource.note_id).join(NoteSecurityMention, NoteSecurityMention.note_id == Note.id).where(Note.user_id == user.id, NoteSecurityMention.security_id == security.id).distinct()).all()
+    lines = [f"# ${security.symbol} {security.company_name or ''}".rstrip(), "", f"Export: {kind}", "", "## Company", workspace.company_description or "No company description recorded.", "", "## How it makes money", workspace.business_model or "No business model recorded."]
+    if kind == "memo":
+        lines += ["", "## Open forecasts"] + [f"- {forecast.metric_name}: {forecast.expected_outcome or forecast.target_value or 'No target'} ({forecast.status})" for forecast in forecasts if forecast.status == "open"]
+        lines += ["", "## Recent research"] + [f"- [{note.type}] {note.title or note.body[:120]} — {note.created_at.date().isoformat()}" for note in notes[:12]]
+    elif kind == "earnings-preview":
+        event = events[0] if events else None
+        lines += ["", "## Earnings preparation"] + ([f"### {event.fiscal_period}", event.pre_expectations or "No expectations recorded.", "", "### KPI watch list", event.pre_kpi_watch_list or "None recorded.", "", "### Debate questions", event.pre_debate_questions or "None recorded.", "", "### Catalysts and risks", event.pre_catalysts or "No catalysts recorded.", event.pre_risks or "No risks recorded."] if event else ["No earnings event recorded."])
+    elif kind == "earnings-review":
+        event = events[0] if events else None
+        lines += ["", "## Earnings review"] + ([f"### {event.fiscal_period}", "#### Expected versus actual", event.post_expected_vs_actual or "No comparison recorded.", "", "#### Thesis impact", event.post_thesis_impact or "None recorded.", "", "#### Decision / action", event.post_decision_action or "None recorded."] if event else ["No earnings event recorded."])
+    else:
+        lines += ["", "## Timeline"] + [f"- {note.created_at.date().isoformat()}: note — {note.title or note.body[:120]}" for note in notes] + [f"- {(event.reporting_date or event.created_at).date().isoformat()}: earnings {event.fiscal_period}" for event in events] + [f"- {forecast.created_at.date().isoformat()}: forecast v{forecast.revision_number} — {forecast.metric_name} ({forecast.status})" for forecast in forecasts]
+    lines += ["", "## Sources"] + [f"- {source.title or source.subject or 'Untitled source'}: {source.original_url or source.canonical_url or 'No URL'}" for source in sources] + ["", "## Underlying notes"] + [f"- {note.id}: {note.title or note.body[:120]}" for note in notes]
+    return PlainTextResponse("\n".join(lines), media_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="{security.symbol.lower()}-{kind}.md"'})
 
 
 @app.get("/api/company-workspaces/{symbol}")
