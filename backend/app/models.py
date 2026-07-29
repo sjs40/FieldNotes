@@ -61,6 +61,51 @@ class UserWorkspacePreference(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class EarningsEvent(Base):
+    """A user-owned, period-specific earnings record. All workflow fields are optional."""
+    __tablename__ = "earnings_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    security_id: Mapped[str] = mapped_column(ForeignKey("securities.id"), index=True)
+    fiscal_period: Mapped[str] = mapped_column(String(128))
+    reporting_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pre_expectations: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pre_kpi_watch_list: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pre_debate_questions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pre_catalysts: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pre_risks: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pre_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    earnings_results: Mapped[str | None] = mapped_column(Text, nullable=True)
+    earnings_guidance: Mapped[str | None] = mapped_column(Text, nullable=True)
+    earnings_kpi_observations: Mapped[str | None] = mapped_column(Text, nullable=True)
+    earnings_management_quotes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    earnings_market_reaction: Mapped[str | None] = mapped_column(Text, nullable=True)
+    earnings_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    post_expected_vs_actual: Mapped[str | None] = mapped_column(Text, nullable=True)
+    post_thesis_impact: Mapped[str | None] = mapped_column(Text, nullable=True)
+    post_question_resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
+    post_decision_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    post_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pre_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "security_id", "fiscal_period", name="uq_earnings_event_period"),)
+
+
+class EarningsEventNote(Base):
+    __tablename__ = "earnings_event_notes"
+    earnings_event_id: Mapped[str] = mapped_column(ForeignKey("earnings_events.id"), primary_key=True)
+    note_id: Mapped[str] = mapped_column(ForeignKey("notes.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class EarningsEventSource(Base):
+    __tablename__ = "earnings_event_sources"
+    earnings_event_id: Mapped[str] = mapped_column(ForeignKey("earnings_events.id"), primary_key=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
 class SecurityPrice(Base):
     __tablename__ = "security_prices"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)

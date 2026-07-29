@@ -10,7 +10,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
-from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, CompanyWorkspace, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, Idea, IdeaSecurity, InboxItem, MetricCard, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings, UserWorkspacePreference, WeeklyReview
+from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, CompanyWorkspace, EarningsEvent, EarningsEventNote, EarningsEventSource, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, Idea, IdeaSecurity, InboxItem, MetricCard, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings, UserWorkspacePreference, WeeklyReview
 from .parser import capture_title, parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
@@ -66,6 +66,30 @@ class CompanyWorkspaceUpdateRequest(BaseModel):
     company_description: str | None = Field(default=None, max_length=20000)
     business_model: str | None = Field(default=None, max_length=20000)
     is_followed: bool | None = None
+
+
+class EarningsEventRequest(BaseModel):
+    fiscal_period: str = Field(default="Unscheduled", min_length=1, max_length=128)
+    reporting_date: datetime | None = None
+    pre_expectations: str | None = Field(default=None, max_length=50000)
+    pre_kpi_watch_list: str | None = Field(default=None, max_length=50000)
+    pre_debate_questions: str | None = Field(default=None, max_length=50000)
+    pre_catalysts: str | None = Field(default=None, max_length=50000)
+    pre_risks: str | None = Field(default=None, max_length=50000)
+    pre_notes: str | None = Field(default=None, max_length=50000)
+    earnings_results: str | None = Field(default=None, max_length=50000)
+    earnings_guidance: str | None = Field(default=None, max_length=50000)
+    earnings_kpi_observations: str | None = Field(default=None, max_length=50000)
+    earnings_management_quotes: str | None = Field(default=None, max_length=50000)
+    earnings_market_reaction: str | None = Field(default=None, max_length=50000)
+    earnings_notes: str | None = Field(default=None, max_length=50000)
+    post_expected_vs_actual: str | None = Field(default=None, max_length=50000)
+    post_thesis_impact: str | None = Field(default=None, max_length=50000)
+    post_question_resolution: str | None = Field(default=None, max_length=50000)
+    post_decision_action: str | None = Field(default=None, max_length=50000)
+    post_notes: str | None = Field(default=None, max_length=50000)
+    note_ids: list[str] = []
+    source_ids: list[str] = []
 
 class FollowUpRequest(PublishRequest):
     relationship_type: str = "updates"
@@ -302,6 +326,48 @@ def _company_workspace(session: Session, user_id: str, symbol: str, *, create: b
 def _workspace_payload(session: Session, workspace: CompanyWorkspace, security: Security, active_security_id: str | None = None) -> dict:
     note_count = session.scalar(select(func.count(NoteSecurityMention.note_id)).join(Note, Note.id == NoteSecurityMention.note_id).where(Note.user_id == workspace.user_id, NoteSecurityMention.security_id == security.id)) or 0
     return {"symbol": security.symbol, "company_name": security.company_name, "company_description": workspace.company_description, "business_model": workspace.business_model, "is_followed": workspace.is_followed, "is_active": security.id == active_security_id, "note_count": note_count, "updated_at": workspace.updated_at.isoformat() if workspace.updated_at else None}
+
+
+EARNINGS_TEXT_FIELDS = (
+    "pre_expectations", "pre_kpi_watch_list", "pre_debate_questions", "pre_catalysts", "pre_risks", "pre_notes",
+    "earnings_results", "earnings_guidance", "earnings_kpi_observations", "earnings_management_quotes", "earnings_market_reaction", "earnings_notes",
+    "post_expected_vs_actual", "post_thesis_impact", "post_question_resolution", "post_decision_action", "post_notes",
+)
+EARNINGS_PRE_FIELDS = set(EARNINGS_TEXT_FIELDS[:6])
+
+
+def _earnings_payload(session: Session, event: EarningsEvent) -> dict:
+    notes = session.scalars(select(Note).join(EarningsEventNote, EarningsEventNote.note_id == Note.id).where(EarningsEventNote.earnings_event_id == event.id).order_by(Note.created_at.desc())).all()
+    sources = session.scalars(select(Source).join(EarningsEventSource, EarningsEventSource.source_id == Source.id).where(EarningsEventSource.earnings_event_id == event.id).order_by(Source.created_at.desc())).all()
+    value = {field: getattr(event, field) for field in EARNINGS_TEXT_FIELDS}
+    return {
+        "id": event.id, "fiscal_period": event.fiscal_period, "reporting_date": event.reporting_date.isoformat() if event.reporting_date else None,
+        "pre_recorded_at": event.pre_recorded_at.isoformat() if event.pre_recorded_at else None,
+        "created_at": event.created_at.isoformat(), "updated_at": event.updated_at.isoformat(), **value,
+        "notes": [{"id": note.id, "title": note.title, "type": note.type, "created_at": note.created_at.isoformat()} for note in notes],
+        "sources": [{"id": source.id, "title": source.title or source.subject or source.original_url, "url": source.original_url or source.canonical_url} for source in sources],
+    }
+
+
+def _replace_earnings_links(session: Session, event: EarningsEvent, user_id: str, note_ids: list[str] | None, source_ids: list[str] | None) -> None:
+    if note_ids is not None:
+        requested = set(note_ids)
+        notes = session.scalars(select(Note).where(Note.id.in_(requested), Note.user_id == user_id)).all() if requested else []
+        if {note.id for note in notes} != requested:
+            raise HTTPException(status_code=404, detail="One or more linked notes were not found")
+        for link in session.scalars(select(EarningsEventNote).where(EarningsEventNote.earnings_event_id == event.id)).all():
+            session.delete(link)
+        for note in notes:
+            session.add(EarningsEventNote(earnings_event_id=event.id, note_id=note.id))
+    if source_ids is not None:
+        requested = set(source_ids)
+        sources = session.scalars(select(Source).where(Source.id.in_(requested), Source.user_id == user_id)).all() if requested else []
+        if {source.id for source in sources} != requested:
+            raise HTTPException(status_code=404, detail="One or more linked sources were not found")
+        for link in session.scalars(select(EarningsEventSource).where(EarningsEventSource.earnings_event_id == event.id)).all():
+            session.delete(link)
+        for source in sources:
+            session.add(EarningsEventSource(earnings_event_id=event.id, source_id=source.id))
 
 
 def _scope_parsed_to_active_company(session: Session, user_id: str, parsed: dict, active_ticker: str | None) -> dict:
@@ -1118,6 +1184,62 @@ def activate_company_workspace(symbol: str, user: CurrentUser = Depends(get_curr
     preference.active_security_id = security.id
     session.commit()
     return _workspace_payload(session, workspace, security, security.id)
+
+
+@app.get("/api/company-workspaces/{symbol}/earnings")
+def list_earnings_events(symbol: str, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None:
+        raise HTTPException(status_code=404, detail="Company workspace not found")
+    events = session.scalars(select(EarningsEvent).where(EarningsEvent.user_id == user.id, EarningsEvent.security_id == security.id).order_by(EarningsEvent.reporting_date.desc(), EarningsEvent.created_at.desc())).all()
+    return [_earnings_payload(session, event) for event in events]
+
+
+@app.post("/api/company-workspaces/{symbol}/earnings")
+def create_earnings_event(symbol: str, payload: EarningsEventRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None:
+        raise HTTPException(status_code=404, detail="Company workspace not found")
+    period = payload.fiscal_period.strip() or "Unscheduled"
+    existing = session.scalar(select(EarningsEvent).where(EarningsEvent.user_id == user.id, EarningsEvent.security_id == security.id, EarningsEvent.fiscal_period == period))
+    if existing:
+        raise HTTPException(status_code=409, detail="An earnings event already exists for this fiscal period")
+    values = {field: getattr(payload, field) for field in EARNINGS_TEXT_FIELDS}
+    event = EarningsEvent(user_id=user.id, security_id=security.id, fiscal_period=period, reporting_date=payload.reporting_date, **values)
+    if any(values[field] for field in EARNINGS_PRE_FIELDS):
+        event.pre_recorded_at = datetime.now(timezone.utc)
+    session.add(event)
+    session.flush()
+    _replace_earnings_links(session, event, user.id, payload.note_ids, payload.source_ids)
+    session.commit()
+    return _earnings_payload(session, event)
+
+
+@app.put("/api/company-workspaces/{symbol}/earnings/{event_id}")
+def update_earnings_event(symbol: str, event_id: str, payload: EarningsEventRequest, user: CurrentUser = Depends(get_current_user), session: Session = Depends(get_session)):
+    workspace, security = _company_workspace(session, user.id, symbol)
+    if workspace is None or security is None:
+        raise HTTPException(status_code=404, detail="Company workspace not found")
+    event = session.scalar(select(EarningsEvent).where(EarningsEvent.id == event_id, EarningsEvent.user_id == user.id, EarningsEvent.security_id == security.id))
+    if event is None:
+        raise HTTPException(status_code=404, detail="Earnings event not found")
+    fields = payload.model_fields_set
+    if "fiscal_period" in fields:
+        period = payload.fiscal_period.strip() or "Unscheduled"
+        duplicate = session.scalar(select(EarningsEvent.id).where(EarningsEvent.user_id == user.id, EarningsEvent.security_id == security.id, EarningsEvent.fiscal_period == period, EarningsEvent.id != event.id))
+        if duplicate:
+            raise HTTPException(status_code=409, detail="An earnings event already exists for this fiscal period")
+        event.fiscal_period = period
+    if "reporting_date" in fields:
+        event.reporting_date = payload.reporting_date
+    for field in EARNINGS_TEXT_FIELDS:
+        if field in fields:
+            setattr(event, field, getattr(payload, field))
+    if event.pre_recorded_at is None and any(field in fields and getattr(payload, field) for field in EARNINGS_PRE_FIELDS):
+        event.pre_recorded_at = datetime.now(timezone.utc)
+    _replace_earnings_links(session, event, user.id, payload.note_ids if "note_ids" in fields else None, payload.source_ids if "source_ids" in fields else None)
+    session.commit()
+    return _earnings_payload(session, event)
 
 
 @app.get("/api/company-workspaces/{symbol}")
