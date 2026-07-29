@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .database import Base, engine, get_session
 from .config import settings
 from .models import Assumption, AssumptionEvent, BrokerageAccount, BrokerageConnection, CallBenchmarkSnapshot, CallEvent, CallExpectation, EmailConnection, Evidence, EvidenceAssumption, EvidenceForecast, EvidenceQuestion, EvidenceThesis, Forecast, ForecastEvent, Idea, IdeaSecurity, InboxItem, MetricCard, Note, NoteRelationship, NoteRevision, NoteSecurityMention, NoteSource, NoteTag, PortfolioPosition, QuestionEvent, ResearchQuestion, SavedView, Source, SourceSecurityMention, SourceTag, Security, SecurityPrice, Tag, ThesisDetails, ThesisReview, ThinkingUpdate, TrackedCall, TrackedCallLeg, UserReviewSettings, WeeklyReview
-from .parser import parse_note
+from .parser import capture_title, parse_note
 from .market_data import YFinanceMarketDataProvider
 from .auth import CurrentUser, get_current_user
 from .journal import call_return_object, create_note, replace_note_relationships, serialize_call, serialize_note as serialize_journal_note
@@ -381,7 +381,7 @@ async def create_draft(payload: PublishRequest, user: CurrentUser = Depends(get_
     parsed = parse_note(payload.body, payload.note_type)
     if parsed["errors"]:
         raise HTTPException(status_code=422, detail={"errors": parsed["errors"]})
-    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="draft")
+    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title or capture_title(parsed), status="draft")
     link_note_source_url(session, user.id, note, payload.source_url)
     save_thesis_details(session, note.id, payload.thesis_details)
     _create_pending_questions(session, user.id, note, payload.pending_questions)
@@ -1066,7 +1066,7 @@ async def publish_note(payload: PublishRequest, user: CurrentUser = Depends(get_
                 quote_failures[symbol] = str(exc)
         if quote_failures:
             raise HTTPException(status_code=503, detail={"message": "Tracked calls were not published because a reference quote could not be captured.", "failures": quote_failures})
-    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title, status="published", quotes=quotes)
+    note = create_note(session, user_id=user.id, parsed=parsed, title=payload.title or capture_title(parsed), status="published", quotes=quotes)
     link_note_source_url(session, user.id, note, payload.source_url)
     save_thesis_details(session, note.id, payload.thesis_details)
     _create_pending_questions(session, user.id, note, payload.pending_questions)

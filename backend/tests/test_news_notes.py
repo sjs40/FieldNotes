@@ -39,7 +39,7 @@ class NewsNoteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         note = response.json()
         self.assertEqual(note["type"], "news")
-        self.assertEqual(note["sources"], [{"id": note["sources"][0]["id"], "title": None, "url": "https://example.com/news/product-update"}])
+        self.assertEqual(note["sources"], [{"id": note["sources"][0]["id"], "title": "Company announced a product update.", "url": "https://example.com/news/product-update"}])
 
         repeated = self.client.post("/api/notes", json={
             "note_type": "news", "body": "A second take on the same announcement.",
@@ -66,6 +66,14 @@ class NewsNoteTests(unittest.TestCase):
         response = self.client.post("/api/notes/publish", json={"note_type": "news", "body": "A headline worth saving."})
         self.assertEqual(response.status_code, 200)
         provider_class.assert_not_called()
+
+    def test_capture_title_excludes_first_line_commands_and_metadata(self):
+        response = self.client.post("/api/notes", json={
+            "body": "/idea $AAPL #product A clean title https://example.com/article\nSupporting context stays in the body.",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["type"], "idea")
+        self.assertEqual(response.json()["title"], "A clean title")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-const TYPES=['observation','idea','thesis','question','task','decision','news','note'];
+const TYPES=['note','observation','idea','thesis','question','task','decision','news'];
 let notes=[], page=sessionStorage.getItem('fieldnotes-active-page')||'today', selected=null, selectedCall=null, composerReturnPage='today';
 sessionStorage.removeItem('fieldnotes-active-page');
 const $=s=>document.querySelector(s);
